@@ -12,6 +12,7 @@ class CatalogService:
         file_path = Path(data_file) if data_file else PRODUCT_DATA_FILE
         with open(file_path, "r", encoding="utf-8") as handle:
             self.products = json.load(handle)
+        self.products_by_id = {product["id"]: product for product in self.products}
 
     def search(self, query: str, limit: int = 5) -> list[CandidateProduct]:
         needle = (query or "").strip().lower()
@@ -53,6 +54,7 @@ class CatalogService:
                             category=product.get("category"),
                             sales_unit=product.get("salesUnit"),
                             base_unit=product.get("baseUnit"),
+                            allowed_lot_size=product.get("allowedLotSize"),
                             country_of_origin=product.get("countryOfOrigin"),
                             relevance_score=score,
                         ),
@@ -63,16 +65,17 @@ class CatalogService:
         return [candidate for _, candidate in ranked[:limit]]
 
     def get_by_id(self, product_id: str) -> CandidateProduct | None:
-        for product in self.products:
-            if product.get("id") == product_id:
-                return CandidateProduct(
-                    product_id=product["id"],
-                    name=(product.get("synkkaData") or {}).get("names", [{}])[0].get("value", product["id"]),
-                    brand=(product.get("synkkaData") or {}).get("brand") or None,
-                    category=product.get("category"),
-                    sales_unit=product.get("salesUnit"),
-                    base_unit=product.get("baseUnit"),
-                    country_of_origin=product.get("countryOfOrigin"),
-                    relevance_score=100,
-                )
-        return None
+        product = self.products_by_id.get(product_id)
+        if product is None:
+            return None
+        return CandidateProduct(
+            product_id=product["id"],
+            name=(product.get("synkkaData") or {}).get("names", [{}])[0].get("value", product["id"]),
+            brand=(product.get("synkkaData") or {}).get("brand") or None,
+            category=product.get("category"),
+            sales_unit=product.get("salesUnit"),
+            base_unit=product.get("baseUnit"),
+            allowed_lot_size=product.get("allowedLotSize"),
+            country_of_origin=product.get("countryOfOrigin"),
+            relevance_score=100,
+        )

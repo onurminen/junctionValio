@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trusted Trade</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #17212b; background: #f3f6f7; }
+    body { margin: 0; }
+    header { background: #123d36; color: white; padding: 1.4rem max(1.2rem, calc((100vw - 1060px) / 2)); }
+    header h1 { margin: 0 0 .35rem; font-size: 1.5rem; }
+    header p { margin: 0; color: #d3e6df; }
+    main { max-width: 1060px; margin: 1.4rem auto; padding: 0 1rem 2rem; display: grid; gap: 1rem; grid-template-columns: minmax(0, 1.3fr) minmax(280px, .7fr); }
+    section { background: white; border: 1px solid #dfe6e7; border-radius: 12px; padding: 1.1rem; box-shadow: 0 2px 8px #18312a0a; }
+    section h2 { margin: 0 0 1rem; font-size: 1.05rem; }
+    .wide { grid-column: 1 / -1; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem; }
+    label { display: grid; gap: .35rem; font-size: .86rem; font-weight: 650; }
+    input { min-width: 0; padding: .65rem .7rem; border: 1px solid #bbc9c9; border-radius: 7px; font: inherit; }
+    .actions { display: flex; flex-wrap: wrap; gap: .55rem; margin-top: 1rem; }
+    button, a.button { border: 0; border-radius: 7px; background: #176b57; color: white; font: inherit; font-weight: 650; padding: .65rem .9rem; cursor: pointer; text-decoration: none; }
+    button.secondary, a.button.secondary { background: #e7efed; color: #1d453d; }
+    button:disabled { opacity: .6; cursor: wait; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 430px; overflow: auto; margin: .6rem 0 0; background: #f5f8f8; padding: .8rem; border-radius: 8px; font-size: .8rem; }
+    .note { color: #4a6060; font-size: .85rem; line-height: 1.45; }
+    .warning { color: #784b14; background: #fff5df; border-radius: 8px; padding: .7rem; font-size: .85rem; }
+    .error { color: #8d2929; }
+    @media (max-width: 720px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Trusted Trade</h1>
+    <p>Product discovery and policy checks grounded in Valio Aimo challenge data.</p>
+  </header>
+  <main>
+    <section>
+      <h2>Build a purchase plan</h2>
+      <form id="plan-form">
+        <div class="form-grid">
+          <label>Product search
+            <input id="query" value="chocolate" required>
+          </label>
+          <label>Quantity
+            <input id="quantity" type="number" min="0.001" step="any" value="1" required>
+          </label>
+          <label>Sales unit code
+            <input id="unit" placeholder="Choose from catalog results" required>
+          </label>
+          <label>Delivery date
+            <input id="requested-date" type="date" required>
+          </label>
+          <label>Agent ID
+            <input id="agent" value="demo-agent" required>
+          </label>
+          <label>Customer/account ID
+            <input id="customer" value="customer-001" required>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" class="secondary" id="search">Search catalog</button>
+          <button type="submit" id="build">Check price and availability</button>
+        </div>
+      </form>
+      <p class="note">Enter quantity in the product's sales unit. Unit codes are technical values from the catalog; no unit conversion is assumed.</p>
+      <div id="search-results" class="note" aria-live="polite"></div>
+    </section>
+
+    <section>
+      <h2>Plan and policy result</h2>
+      <div id="plan-status" class="note">Search and validate a product to see its plan and policy result.</div>
+      <pre id="plan-output" hidden></pre>
+      <div class="actions">
+        <button id="approval-request" class="secondary" hidden>Request human approval</button>
+      </div>
+      <div id="approval-output" class="note" aria-live="polite"></div>
+    </section>
+
+    <section class="wide">
+      <h2>Recent audit events</h2>
+      <div class="actions"><button type="button" id="refresh-audit" class="secondary">Refresh audit</button></div>
+      <pre id="audit-output">Loading…</pre>
+    </section>
+
+    <section class="wide warning">
+      The supplier OpenAPI currently documents price and availability only; this app does not submit orders. Policy defaults fail closed until allowed categories are configured. Approval decisions also require a server-side approver token.
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastPlan = null;
+    const localDate = new Date();
+    $("requested-date").value = [
+      localDate.getFullYear(),
+      String(localDate.getMonth() + 1).padStart(2, "0"),
+      String(localDate.getDate()).padStart(2, "0"),
+    ].join("-");
+
+    async function request(url, options = {}) {
+      const response = await fetch(url, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`);
+      return body;
+    }
+
+    $("search").addEventListener("click", async () => {
+      $("search-results").textContent = "Searching catalog…";
+      try {
+        const query = encodeURIComponent($("query").value);
+        const body = await request(`/api/catalog/search?query=${query}&limit=5`);
+        $("search-results").textContent = body.results.length
+          ? `Candidates (plan uses the highest-ranked match):\n${body.results.map((item) =>
+              `${item.name} — ID ${item.product_id}, sales unit ${item.sales_unit || "unknown"}, category ${item.category || "unknown"}`
+            ).join("\n")}`
+          : "No catalog matches.";
+        if (body.results.length && body.results[0].sales_unit) $("unit").value = body.results[0].sales_unit;
+      } catch (error) {
+        $("search-results").textContent = error.message;
+        $("search-results").classList.add("error");
+      }
+    });
+
+    $("plan-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      $("build").disabled = true;
+      $("plan-status").textContent = "Checking price and availability…";
+      $("approval-request").hidden = true;
+      $("approval-output").textContent = "";
+      try {
+        const body = await request("/api/purchase-plan/build", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agent_id: $("agent").value,
+            customer_id: $("customer").value,
+            requested_date: $("requested-date").value,
+            line_items: [{
+              query: $("query").value,
+              quantity: $("quantity").value,
+              unit: $("unit").value,
+            }],
+          }),
+        });
+        lastPlan = body.plan;
+        $("plan-output").hidden = false;
+        $("plan-output").textContent = JSON.stringify(body, null, 2);
+        $("plan-status").textContent =
+          `Policy: ${body.policy.decision}. Plan ${body.plan.plan_id}; ` +
+          (body.plan.verified ? "price and availability verified." : "not verified; no order can be placed.");
+        $("approval-request").hidden = body.policy.decision !== "PENDING_APPROVAL";
+        await refreshAudit();
+      } catch (error) {
+        $("plan-status").textContent = error.message;
+        $("plan-status").classList.add("error");
+      } finally {
+        $("build").disabled = false;
+      }
+    });
+
+    $("approval-request").addEventListener("click", async () => {
+      if (!lastPlan) return;
+      $("approval-request").disabled = true;
+      try {
+        const body = await request("/api/approvals/request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ plan_id: lastPlan.plan_id }),
+        });
+        $("approval-output").textContent = `Approval requested: ${body.approval.approval_id}`;
+        await refreshAudit();
+      } catch (error) {
+        $("approval-output").textContent = error.message;
+      } finally {
+        $("approval-request").disabled = false;
+      }
+    });
+
+    async function refreshAudit() {
+      try {
+        const body = await request("/api/audit?limit=20");
+        $("audit-output").textContent = JSON.stringify(body.events, null, 2);
+      } catch (error) {
+        $("audit-output").textContent = error.message;
+      }
+    }
+
+    $("refresh-audit").addEventListener("click", refreshAudit);
+    refreshAudit();
+  </script>
+</body>
+</html>

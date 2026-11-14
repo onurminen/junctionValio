@@ -51,6 +51,7 @@ class CandidateProduct(BaseModel):
     category: str | None = None
     sales_unit: str | None = None
     base_unit: str | None = None
+    allowed_lot_size: Decimal | None = None
     country_of_origin: str | None = None
     relevance_score: int = 0
 
@@ -67,6 +68,7 @@ class VerifiedOffer(BaseModel):
 
 class PurchasePlan(BaseModel):
     plan_id: str
+    agent_id: str
     customer_id: str
     delivery_date: date
     lines: list[dict[str, Any]] = Field(default_factory=list)

@@ -1,13 +1,15 @@
 # Trusted Trade
 
-Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. It follows the repository plan for a safe procurement flow: natural-language buyer request → catalog search → validation → policy evaluation → approval snapshot → order submission only when the backend is configured to reach the mock supplier.
+Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. It follows the repository plan for a safe procurement flow: natural-language buyer request → catalog search → price/availability checks → policy evaluation → approval snapshot. The published challenge API documents price and availability lookups but no order-submission endpoint, so this prototype does not submit orders.
 
 ## Features
 
 - Product catalog search against the static Valio challenge dataset
 - Request parsing for simple buyer text
 - Deterministic policy engine with typed outcomes
-- Approval snapshot hashing to prevent unauthorized mutation
+- SQL-backed purchase plan, approval, and audit records (SQLite by default)
+- Approval snapshot hashing, server-side snapshot lookup, and separate approver token
+- Small browser demo at `/`
 - OpenAPI documentation from FastAPI
 - Safe fail-closed behavior when supplier credentials are absent
 
@@ -24,10 +26,21 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 
    pip install -e .
 
-3. Configure environment variables:
+3. Configure environment variables in `.env`:
 
-   cp .env.example .env
-   # then set VALIO_BASE_URL and VALIO_API_KEY before talking to the live mock API
+   test -f .env || cp .env.example .env
+   # set VALIO_API_KEY to the key from the Junction platform
+   # VALIO_BASE_URL defaults to https://junction26.valioaimo.fi
+   # set TRUSTED_TRADE_ALLOWED_CATEGORIES to buyer-approved category codes
+   # configure a private token for each approver before enabling decisions
+
+The demo policy defaults to `demo-agent` associated only with `customer-001`, a
+maximum line quantity of 100 sales units, an order cap of 5000 EUR, and human
+approval from 2500 EUR. Product categories are intentionally not allowed until
+`TRUSTED_TRADE_ALLOWED_CATEGORIES` is configured. Set category codes based on
+the buyer's policy; do not infer them from product descriptions. For multiple
+agent/customer associations, use comma-separated `agent:customer|customer`
+entries. Approver identities are configured with `TRUSTED_TRADE_APPROVERS`.
 
 4. Launch the app:
 
@@ -36,6 +49,8 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 5. Open the Swagger docs:
 
    http://127.0.0.1:8000/docs
+
+   The visual demo is at `http://127.0.0.1:8000/`.
 
 ## Example requests
 
@@ -49,8 +64,18 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 
   curl 'http://127.0.0.1:8000/api/catalog/search?query=chocolate&limit=3'
 
+- Check a purchase plan (replace the sample sales unit/category policy as appropriate):
+
+  curl -X POST http://127.0.0.1:8000/api/purchase-plan/build \
+    -H 'Content-Type: application/json' \
+    -d '{"agent_id":"demo-agent","customer_id":"customer-001","requested_date":"2026-11-16","line_items":[{"query":"chocolate","quantity":"1","unit":"KI"}]}'
+
 ## Notes
 
-- The application intentionally fails closed: without `VALIO_BASE_URL` and `VALIO_API_KEY`, it does not pretend that an order was placed.
+- `.env` is loaded automatically and excluded from Git. Keep the platform API key private.
+- The application intentionally does not claim to submit orders because the published mock API has no order endpoint.
+- Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
+- Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
+- The default policy fails closed for all categories until the buyer's allowed category codes are configured.
 - The live Valio Aimo API is configured through environment variables and never committed to source control.
 - The static JSON dataset in `data/` is used for deterministic local development and tests.

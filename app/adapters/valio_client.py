@@ -68,11 +68,3 @@ class ValioClient:
             response = client.post("/api/availability", json=payload)
             response.raise_for_status()
             return response.json()
-
-    def submit_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.base_url:
-            raise RuntimeError("VALIO_BASE_URL is not configured")
-        with self._client() as client:
-            response = client.post("/api/order", json=order_payload)
-            response.raise_for_status()
-            return response.json()
