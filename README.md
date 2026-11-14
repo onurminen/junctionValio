@@ -34,13 +34,14 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
    # set TRUSTED_TRADE_ALLOWED_CATEGORIES to buyer-approved category codes
    # configure a private token for each approver before enabling decisions
 
-The demo policy defaults to `demo-agent` associated only with `customer-001`, a
-maximum line quantity of 100 sales units, an order cap of 5000 EUR, and human
-approval from 2500 EUR. Product categories are intentionally not allowed until
-`TRUSTED_TRADE_ALLOWED_CATEGORIES` is configured. Set category codes based on
-the buyer's policy; do not infer them from product descriptions. For multiple
-agent/customer associations, use comma-separated `agent:customer|customer`
-entries. Approver identities are configured with `TRUSTED_TRADE_APPROVERS`.
+The demo policy defaults to `demo-agent` associated only with `customer-001`
+and sends every complete proposed order for human approval. The mock API does
+not enforce buyer-specific category or spending limits, so the app has no such
+limits unless you explicitly configure `TRUSTED_TRADE_ALLOWED_CATEGORIES`,
+`TRUSTED_TRADE_MAX_LINE_QUANTITY`, or `TRUSTED_TRADE_MAX_ORDER_VALUE`. For
+multiple agent/customer associations, use comma-separated
+`agent:customer|customer` entries. Approver identities are configured with
+`TRUSTED_TRADE_APPROVERS`.
 
 4. Launch the app:
 
@@ -64,7 +65,7 @@ entries. Approver identities are configured with `TRUSTED_TRADE_APPROVERS`.
 
   curl 'http://127.0.0.1:8000/api/catalog/search?query=chocolate&limit=3'
 
-- Check a purchase plan (replace the sample sales unit/category policy as appropriate):
+- Compare the shortlist and build a purchase plan:
 
   curl -X POST http://127.0.0.1:8000/api/purchase-plan/build \
     -H 'Content-Type: application/json' \
@@ -73,9 +74,11 @@ entries. Approver identities are configured with `TRUSTED_TRADE_APPROVERS`.
 ## Notes
 
 - `.env` is loaded automatically and excluded from Git. Keep the platform API key private.
-- The application intentionally does not claim to submit orders because the published mock API has no order endpoint.
+- The challenge API has no order endpoint; the app produces a structured proposal and holds it for human approval without transmitting it.
 - Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
 - Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
-- The default policy fails closed for all categories until the buyer's allowed category codes are configured.
+- The default policy does not invent category or spending restrictions; configure them only when buyer-specific rules are known.
+- The planner checks a small static-catalog shortlist with batched price/availability API calls and exposes alternatives. Availability values `>= 999999` are reported as unknown, not as stock, and are sent for human review without applying a quantity cap from that sentinel. `closingTime` is checked against the API's `timeNow` for the associated `availableDate`.
+- A `429` from Valio is returned as `429` with `Retry-After` (at least 30 seconds); the client suppresses further calls during that cooldown rather than retrying.
 - The live Valio Aimo API is configured through environment variables and never committed to source control.
 - The static JSON dataset in `data/` is used for deterministic local development and tests.

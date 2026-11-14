@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 import secrets
-from datetime import date
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -15,12 +16,11 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
-from app.adapters.valio_client import ValioClient
+from app.adapters.valio_client import ValioClient, ValioRateLimited
 from app.config import (
     BASE_DIR,
     TRUSTED_TRADE_APPROVER_TOKENS,
     VALIO_API_KEY,
-    VALIO_BASE_URL,
 )
 from app.database import database
 from app.domain import BuyerRequest, PurchasePlan, RequestLine
@@ -67,7 +67,7 @@ class PurchasePlanRequest(BaseModel):
     agent_id: str = "demo-agent"
     customer_id: str = "customer-001"
     requested_date: date
-    line_items: list[RequestLine] = Field(..., min_length=1)
+    line_items: list[RequestLine] = Field(..., min_length=1, max_length=100)
     hard_constraints: list[str] = Field(default_factory=list)
 
 
@@ -95,6 +95,171 @@ def _approver_tokens() -> dict[str, str]:
         if separator and approver.strip() and token.strip():
             tokens[approver.strip()] = token.strip()
     return tokens
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _api_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Europe/Helsinki"))
+    return parsed
+
+
+def _assess_candidate(
+    line: RequestLine,
+    candidate: dict[str, Any],
+    price: dict[str, Any] | None,
+    availability: dict[str, Any] | None,
+    availability_checked_at: Any,
+    requested_date: date,
+) -> dict[str, Any]:
+    price = price or {}
+    availability = availability or {}
+    catalog_price = price.get("catalogPrice")
+    if not isinstance(catalog_price, dict):
+        catalog_price = {}
+    unit_price = _decimal_or_none(catalog_price.get("value"))
+    currency = catalog_price.get("currency") or price.get("currency")
+    price_ok = bool(
+        price
+        and not price.get("error", True)
+        and unit_price is not None
+        and unit_price >= 0
+        and currency
+    )
+    line_total = unit_price * line.quantity if price_ok and unit_price is not None else None
+
+    schedules = availability.get("scheduleLines")
+    schedule = schedules[0] if isinstance(schedules, list) and len(schedules) == 1 and isinstance(schedules[0], dict) else {}
+    sales_unit = candidate.get("sales_unit")
+    unit_matches = bool(
+        line.unit
+        and sales_unit
+        and line.unit.upper() == sales_unit.upper()
+        and (schedule.get("salesUnit") or "").upper() == line.unit.upper()
+    )
+    lot_size = _decimal_or_none(candidate.get("allowed_lot_size"))
+    lot_size_matches = bool(
+        lot_size is not None
+        and lot_size > 0
+        and line.quantity % lot_size == 0
+    )
+    available_amount = _decimal_or_none(schedule.get("availableAmount"))
+    available_date = schedule.get("availableDate")
+    closing_time = availability.get("closingTime")
+    availability_status = "AVAILABILITY_UNCHECKED"
+    availability_unknown = False
+    is_terminal = False
+
+    if availability:
+        if availability.get("salesBlock", True):
+            availability_status = "SALES_BLOCKED"
+        elif not schedules:
+            availability_status = "UNAVAILABLE"
+        elif len(schedules) != 1 or not schedule:
+            availability_status = "INVALID_SCHEDULE"
+        elif schedule.get("salesBlock", True):
+            availability_status = "SALES_BLOCKED"
+        else:
+            is_terminal = (
+                available_amount is not None
+                and available_amount >= Decimal("999999")
+            )
+            if not is_terminal and available_amount is None:
+                availability_status = "AVAILABILITY_UNKNOWN"
+            elif not is_terminal and available_amount < line.quantity:
+                availability_status = "INSUFFICIENT_STOCK"
+            else:
+                schedule_date: date | None = None
+                if isinstance(available_date, str):
+                    try:
+                        schedule_date = date.fromisoformat(available_date[:10])
+                    except ValueError:
+                        pass
+                if schedule_date is None:
+                    availability_status = "DELIVERY_DATE_UNKNOWN"
+                elif schedule_date > requested_date:
+                    availability_status = "DELIVERY_TOO_LATE"
+                else:
+                    if is_terminal:
+                        availability_status = "TERMINAL_AVAILABILITY_UNKNOWN"
+                        availability_unknown = True
+                    else:
+                        availability_status = "AVAILABLE"
+
+                    if availability_status in {"AVAILABLE", "TERMINAL_AVAILABILITY_UNKNOWN"}:
+                        cutoff = _api_datetime(closing_time)
+                        checked_at = _api_datetime(availability_checked_at)
+                        if closing_time and cutoff is None:
+                            availability_status = "CUTOFF_UNKNOWN"
+                            availability_unknown = True
+                        elif cutoff and checked_at is None:
+                            availability_status = "CUTOFF_UNKNOWN"
+                            availability_unknown = True
+                        elif cutoff and checked_at and checked_at > cutoff:
+                            availability_status = "CUTOFF_PASSED"
+
+    availability_eligible = availability_status in {
+        "AVAILABLE",
+        "TERMINAL_AVAILABILITY_UNKNOWN",
+        "CUTOFF_UNKNOWN",
+    }
+    eligible = price_ok and unit_matches and lot_size_matches and availability_eligible
+    reasons: list[str] = []
+    if not price_ok:
+        reasons.append("price is missing or invalid")
+    if not unit_matches:
+        reasons.append("requested unit does not match the product sales unit")
+    if not lot_size_matches:
+        reasons.append("quantity does not match the product's allowed lot size")
+    if availability_status == "TERMINAL_AVAILABILITY_UNKNOWN":
+        reasons.append("supplier availability is unknown; the quantity is not capped by this snapshot")
+    elif availability_status == "CUTOFF_UNKNOWN":
+        reasons.append("the delivery cutoff could not be verified")
+    elif availability_status != "AVAILABLE":
+        reasons.append(availability_status.lower().replace("_", " "))
+
+    return {
+        "product_id": candidate["product_id"],
+        "name": candidate["name"],
+        "category": candidate.get("category"),
+        "relevance_score": candidate.get("relevance_score", 0),
+        "sales_unit": sales_unit,
+        "quantity": str(line.quantity),
+        "unit": line.unit,
+        "unit_price": str(unit_price) if unit_price is not None else None,
+        "line_total": str(line_total) if line_total is not None else None,
+        "currency": currency,
+        "available_amount": (
+            str(available_amount)
+            if available_amount is not None and not is_terminal
+            else None
+        ),
+        "availability_quantity_is_unknown": is_terminal,
+        "available_date": available_date,
+        "closing_time": closing_time,
+        "availability_checked_at": availability_checked_at,
+        "availability_status": availability_status,
+        "price_verified": price_ok,
+        "availability_verified": availability_status == "AVAILABLE",
+        "lot_size": str(lot_size) if lot_size is not None else None,
+        "eligible": eligible,
+        "review_reasons": reasons,
+    }
 
 
 def _infer_request(text: str, customer_id: str, agent_id: str, requested_date: date | None) -> BuyerRequest:
@@ -166,28 +331,50 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
         hard_constraints=payload.hard_constraints,
     )
 
-    chosen_products: list[dict[str, Any] | None] = []
+    candidate_lists: list[list[dict[str, Any]]] = []
     for line in request.line_items:
-        matches = catalog_service.search(line.query, limit=3)
-        chosen_products.append(
-            matches[0].model_dump(mode="json") if matches else None
-        )
+        matches = catalog_service.search(line.query, limit=5)
+        candidates = [candidate.model_dump(mode="json") for candidate in matches]
+        if line.selected_product_id:
+            selected = next(
+                (item for item in candidates if item["product_id"] == line.selected_product_id),
+                None,
+            )
+            if selected is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="selected_product_id must be one of the catalog matches for this query",
+                )
+            candidates = [selected]
+        candidate_lists.append(candidates)
 
     product_ids = list(dict.fromkeys(
-        candidate["product_id"] for candidate in chosen_products if candidate
+        candidate["product_id"]
+        for candidates in candidate_lists
+        for candidate in candidates
     ))
     price_by_id: dict[str, dict[str, Any]] = {}
     availability_by_id: dict[str, dict[str, Any]] = {}
-    total_value: Decimal | None = None
-    currency: str | None = None
-    verified = False
-    lines: list[dict[str, Any]] = []
 
     if product_ids and VALIO_API_KEY:
         client = ValioClient()
         try:
             price_response = client.fetch_price(request.customer_id, request.requested_date, product_ids)
             availability_response = client.fetch_availability(request.customer_id, request.requested_date, product_ids)
+        except ValioRateLimited as exc:
+            audit_service.record(
+                actor=request.agent_id,
+                action="price_availability_checked",
+                outcome="rate_limited",
+                entity_type="customer",
+                entity_id=request.customer_id,
+                metadata={"retry_after_seconds": exc.retry_after},
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Valio API rate limit reached; wait before retrying",
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise HTTPException(
                 status_code=502,
@@ -206,118 +393,107 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
             for entry in availability_response["products"]
             if isinstance(entry, dict) and isinstance(entry.get("productId"), str)
         }
+        audit_service.record(
+            actor=request.agent_id,
+            action="price_availability_checked",
+            outcome="success",
+            entity_type="customer",
+            entity_id=request.customer_id,
+            metadata={
+                "candidate_count": len(product_ids),
+                "price_date": request.requested_date.isoformat(),
+            },
+        )
 
-    total_value = (
-        Decimal("0")
-        if product_ids and all(candidate is not None for candidate in chosen_products)
-        else None
-    )
-    verified = total_value is not None
-    currencies: set[str] = set()
+    lines: list[dict[str, Any]] = []
     candidate_products: list[dict[str, Any]] = []
-    for line, candidate in zip(request.line_items, chosen_products, strict=True):
-        if candidate is None:
+    total_value = Decimal("0")
+    currencies: set[str] = set()
+    complete = True
+    verified = True
+    availability_unknown = False
+    for line, candidates in zip(request.line_items, candidate_lists, strict=True):
+        assessments = [
+            _assess_candidate(
+                line=line,
+                candidate=candidate,
+                price=price_by_id.get(candidate["product_id"]),
+                availability=availability_by_id.get(candidate["product_id"]),
+                availability_checked_at=availability_response.get("timeNow") if availability_by_id else None,
+                requested_date=request.requested_date,
+            )
+            for candidate in candidates
+        ]
+        selected = next((item for item in assessments if item["eligible"]), None)
+        if selected is None:
+            complete = False
             verified = False
-            total_value = None
             lines.append({
                 "query": line.query,
                 "quantity": str(line.quantity),
                 "unit": line.unit,
-                "status": "NO_CANDIDATE",
+                "selected_product_id": line.selected_product_id,
+                "status": "NO_ELIGIBLE_CANDIDATE",
+                "alternatives": assessments,
             })
             continue
 
-        candidate_products.append(candidate)
-        product_id = candidate["product_id"]
-        price = price_by_id.get(product_id, {})
-        catalog_price = price.get("catalogPrice")
-        availability = availability_by_id.get(product_id, {})
-        schedules = availability.get("scheduleLines", [])
-        schedule = schedules[0] if len(schedules) == 1 and isinstance(schedules[0], dict) else {}
-        product_currency = (
-            (catalog_price or {}).get("currency")
-            or price.get("currency")
+        chosen_candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate["product_id"] == selected["product_id"]
         )
-        unit_price = Decimal(str(catalog_price["value"])) if catalog_price and catalog_price.get("value") is not None else None
-        line_total = unit_price * line.quantity if unit_price is not None else None
-        if product_currency:
-            currencies.add(product_currency)
-        if total_value is not None and line_total is not None:
-            total_value += line_total
-        else:
-            total_value = None
-
-        unit_matches = bool(
-            line.unit
-            and candidate.get("sales_unit")
-            and line.unit.upper() == candidate["sales_unit"].upper()
-            and schedule.get("salesUnit", "").upper() == line.unit.upper()
-        )
-        lot_size = Decimal(str(candidate["allowed_lot_size"])) if candidate.get("allowed_lot_size") is not None else None
-        lot_matches = lot_size is None or line.quantity % lot_size == 0
-        available_amount = Decimal(str(schedule["availableAmount"])) if schedule.get("availableAmount") is not None else None
-        available_date = schedule.get("availableDate")
-        date_matches = False
-        if isinstance(available_date, str):
-            try:
-                date_matches = date.fromisoformat(available_date[:10]) <= request.requested_date
-            except ValueError:
-                date_matches = False
-        is_terminal = (availability.get("logisticModel") or "").casefold() == "terminal"
-        stock_ok = bool(
-            not is_terminal
-            and availability
-            and not availability.get("salesBlock", True)
-            and not schedule.get("salesBlock", True)
-            and available_amount is not None
-            and available_amount >= line.quantity
-            and date_matches
-        )
-        price_ok = bool(
-            price
-            and not price.get("error", True)
-            and catalog_price
-            and product_currency
-        )
-        line_verified = price_ok and stock_ok and unit_matches and lot_matches
-        verified = verified and line_verified
+        candidate_products.append(chosen_candidate)
+        total_value += Decimal(selected["line_total"])
+        if selected["currency"]:
+            currencies.add(selected["currency"])
+        line_unknown = selected["availability_status"] != "AVAILABLE"
+        availability_unknown = availability_unknown or line_unknown
+        verified = verified and not line_unknown
         lines.append({
             "query": line.query,
-            "product_id": product_id,
-            "name": candidate["name"],
+            "product_id": selected["product_id"],
+            "name": selected["name"],
             "quantity": str(line.quantity),
             "unit": line.unit,
-            "sales_unit": candidate.get("sales_unit"),
-            "unit_price": str(unit_price) if unit_price is not None else None,
-            "line_total": str(line_total) if line_total is not None else None,
-            "currency": product_currency,
-            "available_amount": str(available_amount) if available_amount is not None else None,
-            "available_date": available_date,
-            "availability_checked_at": availability_response.get("timeNow") if availability_by_id else None,
-            "status": "VERIFIED" if line_verified else "UNVERIFIED",
-            "checks": {
-                "price": price_ok,
-                "availability": stock_ok,
-                "unit_match": unit_matches,
-                "lot_size_match": lot_matches,
-            },
+            "sales_unit": selected["sales_unit"],
+            "unit_price": selected["unit_price"],
+            "line_total": selected["line_total"],
+            "currency": selected["currency"],
+            "available_amount": selected["available_amount"],
+            "availability_quantity_is_unknown": selected["availability_quantity_is_unknown"],
+            "available_date": selected["available_date"],
+            "closing_time": selected["closing_time"],
+            "availability_checked_at": selected["availability_checked_at"],
+            "availability_status": selected["availability_status"],
+            "status": "PENDING_HUMAN_APPROVAL",
+            "review_reasons": selected["review_reasons"],
+            "alternatives": assessments,
         })
 
-    if len(currencies) != 1:
+    if not complete or len(currencies) != 1:
         verified = False
-        if len(currencies) > 1:
-            total_value = None
+        total_value_result = None
     else:
-        currency = next(iter(currencies))
+        total_value_result = total_value
+    currency = next(iter(currencies)) if len(currencies) == 1 else None
 
-    policy = policy_engine.evaluate(request, candidate_products, total_value, verified, currency)
+    policy = policy_engine.evaluate(
+        request,
+        candidate_products,
+        total_value_result,
+        verified,
+        currency,
+        availability_unknown=availability_unknown,
+        complete=complete,
+    )
     plan = PurchasePlan(
         plan_id=f"plan-{uuid4().hex}",
         agent_id=request.agent_id,
         customer_id=request.customer_id,
         delivery_date=request.requested_date,
         lines=lines,
-        total_value=total_value,
+        total_value=total_value_result,
         currency=currency,
         verified=verified,
         policy_decision=policy.decision,
@@ -338,7 +514,7 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
         entity_id=plan.plan_id,
         metadata={
             "verified": verified,
-            "total_value": str(total_value) if total_value is not None else None,
+            "total_value": str(total_value_result) if total_value_result is not None else None,
             "currency": currency,
             "line_count": len(lines),
             "reasons": policy.reasons,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from app.config import PRODUCT_DATA_FILE
@@ -13,6 +14,14 @@ class CatalogService:
         with open(file_path, "r", encoding="utf-8") as handle:
             self.products = json.load(handle)
         self.products_by_id = {product["id"]: product for product in self.products}
+
+    @staticmethod
+    def _allowed_lot_size(product: dict) -> Decimal | None:
+        value = product.get("allowedLotSize")
+        if value is None:
+            return None
+        lot_size = Decimal(str(value))
+        return Decimal("1") if lot_size == Decimal("0.01") else lot_size
 
     def search(self, query: str, limit: int = 5) -> list[CandidateProduct]:
         needle = (query or "").strip().lower()
@@ -54,7 +63,7 @@ class CatalogService:
                             category=product.get("category"),
                             sales_unit=product.get("salesUnit"),
                             base_unit=product.get("baseUnit"),
-                            allowed_lot_size=product.get("allowedLotSize"),
+                            allowed_lot_size=self._allowed_lot_size(product),
                             country_of_origin=product.get("countryOfOrigin"),
                             relevance_score=score,
                         ),
@@ -75,7 +84,7 @@ class CatalogService:
             category=product.get("category"),
             sales_unit=product.get("salesUnit"),
             base_unit=product.get("baseUnit"),
-            allowed_lot_size=product.get("allowedLotSize"),
+            allowed_lot_size=self._allowed_lot_size(product),
             country_of_origin=product.get("countryOfOrigin"),
             relevance_score=100,
         )

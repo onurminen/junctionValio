@@ -25,6 +25,9 @@
     .note { color: #4a6060; font-size: .85rem; line-height: 1.45; }
     .warning { color: #784b14; background: #fff5df; border-radius: 8px; padding: .7rem; font-size: .85rem; }
     .error { color: #8d2929; }
+    .candidate { display: flex; justify-content: space-between; align-items: flex-start; gap: .8rem; border-top: 1px solid #e6eceb; padding: .7rem 0; }
+    .candidate button { flex: 0 0 auto; padding: .45rem .65rem; }
+    .candidate-details { font-size: .84rem; line-height: 1.45; }
     @media (max-width: 720px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
   </style>
 </head>
@@ -59,6 +62,7 @@
         </div>
         <div class="actions">
           <button type="button" class="secondary" id="search">Search catalog</button>
+          <button type="button" class="secondary" id="compare">Compare shortlist</button>
           <button type="submit" id="build">Check price and availability</button>
         </div>
       </form>
@@ -69,6 +73,7 @@
     <section>
       <h2>Plan and policy result</h2>
       <div id="plan-status" class="note">Search and validate a product to see its plan and policy result.</div>
+      <div id="alternatives"></div>
       <pre id="plan-output" hidden></pre>
       <div class="actions">
         <button id="approval-request" class="secondary" hidden>Request human approval</button>
@@ -83,12 +88,14 @@
     </section>
 
     <section class="wide warning">
-      The supplier OpenAPI currently documents price and availability only; this app does not submit orders. Policy defaults fail closed until allowed categories are configured. Approval decisions also require a server-side approver token.
+      The mock API does not accept orders. This demo creates a proposed order for human review; terminal availability is shown as unknown, never as confirmed stock.
     </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
     let lastPlan = null;
+    let selectedProductId = null;
+    $("query").addEventListener("input", () => { selectedProductId = null; });
     const localDate = new Date();
     $("requested-date").value = [
       localDate.getFullYear(),
@@ -99,34 +106,64 @@
     async function request(url, options = {}) {
       const response = await fetch(url, options);
       const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`);
+      if (!response.ok) {
+        const cooldown = response.headers.get("Retry-After");
+        const message = body.detail || `Request failed (${response.status})`;
+        throw new Error(message + (cooldown ? ` Retry after ${cooldown} seconds.` : ""));
+      }
       return body;
     }
 
     $("search").addEventListener("click", async () => {
-      $("search-results").textContent = "Searching catalog…";
+      const results = $("search-results");
+      results.textContent = "Searching catalog…";
       try {
         const query = encodeURIComponent($("query").value);
         const body = await request(`/api/catalog/search?query=${query}&limit=5`);
-        $("search-results").textContent = body.results.length
-          ? `Candidates (plan uses the highest-ranked match):\n${body.results.map((item) =>
-              `${item.name} — ID ${item.product_id}, sales unit ${item.sales_unit || "unknown"}, category ${item.category || "unknown"}`
-            ).join("\n")}`
-          : "No catalog matches.";
-        if (body.results.length && body.results[0].sales_unit) $("unit").value = body.results[0].sales_unit;
+        results.replaceChildren();
+        if (!body.results.length) {
+          results.textContent = "No catalog matches.";
+          return;
+        }
+        for (const item of body.results) {
+          const row = document.createElement("div");
+          row.className = "candidate";
+          const details = document.createElement("div");
+          details.className = "candidate-details";
+          details.textContent = `${item.name} · ID ${item.product_id} · sales unit ${item.sales_unit || "unknown"} · category ${item.category || "unknown"}`;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "secondary";
+          button.textContent = "Select";
+          button.addEventListener("click", () => {
+            selectedProductId = item.product_id;
+            $("unit").value = item.sales_unit || "";
+            results.querySelectorAll("button").forEach((candidateButton) => {
+              candidateButton.textContent = candidateButton === button ? "Selected" : "Select";
+            });
+          });
+          row.append(details, button);
+          results.append(row);
+        }
       } catch (error) {
-        $("search-results").textContent = error.message;
-        $("search-results").classList.add("error");
+        results.textContent = error.message;
+        results.classList.add("error");
       }
     });
 
-    $("plan-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
+    async function buildPlan() {
       $("build").disabled = true;
       $("plan-status").textContent = "Checking price and availability…";
       $("approval-request").hidden = true;
       $("approval-output").textContent = "";
+      $("alternatives").replaceChildren();
       try {
+        const line = {
+          query: $("query").value,
+          quantity: $("quantity").value,
+          unit: $("unit").value,
+        };
+        if (selectedProductId) line.selected_product_id = selectedProductId;
         const body = await request("/api/purchase-plan/build", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -134,11 +171,7 @@
             agent_id: $("agent").value,
             customer_id: $("customer").value,
             requested_date: $("requested-date").value,
-            line_items: [{
-              query: $("query").value,
-              quantity: $("quantity").value,
-              unit: $("unit").value,
-            }],
+            line_items: [line],
           }),
         });
         lastPlan = body.plan;
@@ -146,8 +179,41 @@
         $("plan-output").textContent = JSON.stringify(body, null, 2);
         $("plan-status").textContent =
           `Policy: ${body.policy.decision}. Plan ${body.plan.plan_id}; ` +
-          (body.plan.verified ? "price and availability verified." : "not verified; no order can be placed.");
+          (body.plan.verified
+            ? "known stock and price checked; awaiting human approval."
+            : "review the availability state and alternatives before approving.");
         $("approval-request").hidden = body.policy.decision !== "PENDING_APPROVAL";
+        for (const orderLine of body.plan.lines) {
+          const heading = document.createElement("h3");
+          heading.textContent = `Alternatives for ${orderLine.query}`;
+          $("alternatives").append(heading);
+          for (const option of orderLine.alternatives || []) {
+            const row = document.createElement("div");
+            row.className = "candidate";
+            const details = document.createElement("div");
+            details.className = "candidate-details";
+            const quantity = option.availability_quantity_is_unknown
+              ? "quantity unknown (no stock cap inferred)"
+              : `available ${option.available_amount ?? "unknown"} ${option.sales_unit || ""}`;
+            details.textContent =
+              `${option.name} · ${option.availability_status} · ${quantity} · ` +
+              `price ${option.unit_price ?? "unknown"} ${option.currency ?? ""} per ${option.sales_unit || "unit"}` +
+              (option.closing_time ? ` · cutoff ${option.closing_time}` : "") +
+              (option.review_reasons?.length ? ` · ${option.review_reasons.join("; ")}` : "");
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "secondary";
+            button.textContent = option.eligible ? "Use this option" : "Not eligible";
+            button.disabled = !option.eligible;
+            button.addEventListener("click", () => {
+              selectedProductId = option.product_id;
+              $("unit").value = option.sales_unit || "";
+              buildPlan();
+            });
+            row.append(details, button);
+            $("alternatives").append(row);
+          }
+        }
         await refreshAudit();
       } catch (error) {
         $("plan-status").textContent = error.message;
@@ -155,6 +221,15 @@
       } finally {
         $("build").disabled = false;
       }
+    }
+
+    $("plan-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await buildPlan();
+    });
+    $("compare").addEventListener("click", async () => {
+      selectedProductId = null;
+      await buildPlan();
     });
 
     $("approval-request").addEventListener("click", async () => {

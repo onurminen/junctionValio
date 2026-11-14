@@ -6,7 +6,7 @@ from typing import Any
 from app.config import (
     TRUSTED_TRADE_AGENT_CUSTOMERS,
     TRUSTED_TRADE_ALLOWED_CATEGORIES,
-    TRUSTED_TRADE_APPROVAL_THRESHOLD,
+    TRUSTED_TRADE_REQUIRE_HUMAN_APPROVAL,
     TRUSTED_TRADE_MAX_LINE_QUANTITY,
     TRUSTED_TRADE_MAX_ORDER_VALUE,
 )
@@ -29,30 +29,29 @@ class PolicyEngine:
     def __init__(
         self,
         max_order_value: Decimal | None = None,
-        approval_threshold: Decimal | None = None,
         max_line_quantity: Decimal | None = None,
         agent_customers: dict[str, set[str]] | None = None,
         allowed_categories: set[str] | None = None,
+        require_human_approval: bool | None = None,
     ) -> None:
         self.max_order_value = (
             max_order_value
             if max_order_value is not None
             else Decimal(TRUSTED_TRADE_MAX_ORDER_VALUE)
-        )
-        self.approval_threshold = (
-            approval_threshold
-            if approval_threshold is not None
-            else Decimal(TRUSTED_TRADE_APPROVAL_THRESHOLD)
+            if TRUSTED_TRADE_MAX_ORDER_VALUE
+            else None
         )
         self.max_line_quantity = (
             max_line_quantity
             if max_line_quantity is not None
             else Decimal(TRUSTED_TRADE_MAX_LINE_QUANTITY)
+            if TRUSTED_TRADE_MAX_LINE_QUANTITY
+            else None
         )
-        if self.max_order_value <= 0 or self.max_line_quantity <= 0:
+        if (self.max_order_value is not None and self.max_order_value <= 0) or (
+            self.max_line_quantity is not None and self.max_line_quantity <= 0
+        ):
             raise ValueError("policy order and quantity limits must be positive")
-        if self.approval_threshold < 0 or self.approval_threshold > self.max_order_value:
-            raise ValueError("approval threshold must be between zero and the order-value limit")
         self.agent_customers = (
             agent_customers
             if agent_customers is not None
@@ -66,6 +65,12 @@ class PolicyEngine:
                 for category in TRUSTED_TRADE_ALLOWED_CATEGORIES.split(",")
                 if category.strip()
             }
+            or None
+        )
+        self.require_human_approval = (
+            require_human_approval
+            if require_human_approval is not None
+            else TRUSTED_TRADE_REQUIRE_HUMAN_APPROVAL
         )
 
     def evaluate(
@@ -75,8 +80,11 @@ class PolicyEngine:
         total_value: Decimal | None,
         verified: bool,
         currency: str | None,
+        availability_unknown: bool = False,
+        complete: bool = True,
     ) -> PolicyEvaluation:
         reasons: list[str] = []
+        review_reasons: list[str] = []
         facts: dict[str, Any] = {
             "agent_id": request.agent_id,
             "customer_id": request.customer_id,
@@ -84,36 +92,52 @@ class PolicyEngine:
             "verified": verified,
             "total_value": str(total_value) if total_value is not None else "unknown",
             "currency": currency,
-            "policy_categories_configured": bool(self.allowed_categories),
-            "max_line_quantity": str(self.max_line_quantity),
-            "max_order_value": str(self.max_order_value),
-            "approval_threshold": str(self.approval_threshold),
+            "policy_categories_configured": self.allowed_categories is not None,
+            "max_line_quantity": (
+                str(self.max_line_quantity) if self.max_line_quantity is not None else None
+            ),
+            "max_order_value": (
+                str(self.max_order_value) if self.max_order_value is not None else None
+            ),
+            "human_approval_required": self.require_human_approval,
         }
 
         allowed_customers = self.agent_customers.get(request.agent_id)
         if allowed_customers is None or request.customer_id not in allowed_customers:
             reasons.append("agent is not authorized for this customer/account")
-        if not verified:
-            reasons.append("price and availability have not been verified by the mock backend")
+        if not complete:
+            reasons.append("not all requested lines have an eligible priced candidate")
+        if not verified and not availability_unknown:
+            reasons.append("required price or availability facts are not verified")
+        if availability_unknown:
+            review_reasons.append("terminal availability is unknown; human review is required")
 
         if total_value is None:
             reasons.append("order total is unknown")
-        elif total_value > self.max_order_value:
+        elif self.max_order_value is not None and total_value > self.max_order_value:
             reasons.append("order exceeds maximum allowed value")
         if currency != "EUR":
             reasons.append("currency is unknown or unsupported")
-        if not self.allowed_categories:
-            reasons.append("no product categories are configured in procurement policy")
 
         for line in request.line_items:
-            if line.quantity <= 0 or line.quantity > self.max_line_quantity:
+            if line.quantity <= 0 or (
+                self.max_line_quantity is not None
+                and line.quantity > self.max_line_quantity
+            ):
                 reasons.append(f"line item quantity is invalid for {line.query}")
-            if line.category and line.category not in self.allowed_categories:
+            if (
+                self.allowed_categories is not None
+                and line.category
+                and line.category not in self.allowed_categories
+            ):
                 reasons.append(f"product category is not permitted: {line.category}")
 
         if any(
-            not candidate.get("category")
-            or candidate.get("category") not in self.allowed_categories
+            self.allowed_categories is not None
+            and (
+                not candidate.get("category")
+                or candidate.get("category") not in self.allowed_categories
+            )
             for candidate in candidate_products
         ):
             reasons.append("external product category is outside the policy allow-list")
@@ -128,10 +152,10 @@ class PolicyEngine:
                 facts=facts,
             )
 
-        if total_value is not None and total_value >= self.approval_threshold:
+        if self.require_human_approval or availability_unknown:
             return PolicyEvaluation(
                 decision=PolicyDecision.PENDING_APPROVAL,
-                reasons=["order exceeds auto-approval threshold"],
+                reasons=review_reasons or ["order requires human approval before commitment"],
                 facts=facts,
             )
 

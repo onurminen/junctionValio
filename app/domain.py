@@ -26,6 +26,7 @@ class RequestLine(BaseModel):
     quantity: Decimal = Field(..., gt=0)
     unit: str | None = None
     category: str | None = None
+    selected_product_id: str | None = None
 
     @field_validator("unit")
     @classmethod
