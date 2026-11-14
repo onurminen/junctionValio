@@ -32,7 +32,19 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
    # set VALIO_API_KEY to the key from the Junction platform
    # VALIO_BASE_URL defaults to https://junction26.valioaimo.fi
    # set TRUSTED_TRADE_ALLOWED_CATEGORIES to buyer-approved category codes
-   # configure a private token for each approver before enabling decisions
+   # configure private agent and approver tokens before enabling protected actions
+
+   Generate each private token locally with:
+
+   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+
+   Store the output only in `.env` or your deployment secret manager. For
+   example, use `TRUSTED_TRADE_AGENT_TOKENS=demo-agent:<agent-token>` and
+   `TRUSTED_TRADE_APPROVER_TOKENS=human-approver:<approver-token>`. Keep
+   the corresponding IDs in `TRUSTED_TRADE_AGENT_CUSTOMERS` and
+   `TRUSTED_TRADE_APPROVERS`; send the agent token in `X-Agent-Token` and
+   the approver token in `X-Approver-Token`. Do not reuse the same token
+   for both roles.
 
 The demo policy defaults to `demo-agent` associated only with `customer-001`
 and sends every complete proposed order for human approval. In development,
@@ -87,11 +99,14 @@ multiple agent/customer associations, use comma-separated
 - The browser includes an authenticated approval queue that displays the frozen snapshot and policy rationale before approve/reject. The approver token is entered at runtime and is not stored by the page.
 - Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
 - Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
-- Listing approvals and reading their frozen snapshots also require the approver token; decisions are bound to the identity matched from that token.
+- Listing approvals, reading their frozen snapshots, and reading the audit trail also require the approver token; decisions are bound to the identity matched from that token.
 - The default policy does not invent category or spending restrictions; configure them only when buyer-specific rules are known.
 - The request interpreter handles one product line at a time, never fills missing quantity/date/sales unit with defaults, and requires manual splitting or clarification for ambiguous multi-item requests.
 - The planner checks a small static-catalog shortlist with batched price/availability API calls and exposes alternatives. Availability values `>= 999999` are reported as unknown, not as stock, and are sent for human review without applying a quantity cap from that sentinel. `closingTime` is checked against the API's `timeNow` for the associated `availableDate`.
 - Eligible alternatives are ranked by catalog price per matching sales unit; the API's kg/litre comparison price is shown separately and is never used to imply a unit conversion.
+- External callers can provide an exact catalog category code on a request line; candidate search and eligibility checks enforce it rather than treating it as a search keyword.
+- Hard allergen exclusions accept exact source IDs in `excluded_allergen_ids`. A candidate qualifies only with explicit `FREE_FROM` evidence; `CONTAINS`, `MAY_CONTAIN`, `UNDECLARED`, conflicting, or missing data fails closed. Allergen IDs are not translated from natural-language names because the supplied schema contains no ID-to-name dictionary.
+- Free-form `hard_constraints` are rejected by policy until represented as supported structured fields; a constraint must never be treated as satisfied merely because it was recorded as text.
 - A `429` from Valio is returned as `429` with `Retry-After` (at least 30 seconds); the client suppresses further calls during that cooldown rather than retrying.
 - The live Valio Aimo API is configured through environment variables and never committed to source control.
 - The static JSON dataset in `data/` is used for deterministic local development and tests.

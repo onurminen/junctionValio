@@ -38,41 +38,55 @@ or spend limits, so the prototype requires human approval by default.
 
 ### Must work for the demo
 
--   [ ] Backend can authenticate with and call the Valio Aimo mock API.
--   [ ] Product search returns real mock-catalog results.
--   [ ] Price and availability can be checked for selected products and
-    requested quantities/delivery dates.
--   [ ] A natural-language request is converted into validated
-    structured data.
--   [ ] Candidate products are ranked against explicit buyer
-    requirements.
--   [ ] A validated order proposal can be created for human approval.
+-   [x] Backend authenticates to Valio's price/availability API; a live
+    smoke check has succeeded. Product discovery itself uses the supplied
+    catalog dataset because the challenge API has no search endpoint.
+-   [x] Product search returns records from the supplied catalog.
+-   [x] Price and availability are checked for selected products,
+    quantities, and delivery dates.
+-   [x] Request interpretation validates explicit values and asks for
+    missing or ambiguous fields. It intentionally supports one product
+    line at a time; it does not guess unit conversions.
+-   [x] Candidates are filtered by exact category/allergen source codes
+    when provided and ranked by eligible EUR catalog price per matching
+    sales unit. Allergen names are not translated to codes, and
+    unsupported free-form hard constraints are rejected.
+-   [x] A validated local proposal can be persisted for human approval.
     No supplier order submission is possible with the challenge API.
--   [x] Agent permissions and spending limits are enforced server-side.
-    Request, plan, and approval-request routes bind the caller to an
-    `X-Agent-Token`; production fails closed when tokens are missing.
--   [ ] A purchase proposal can be held for human approval.
--   [ ] Approval is bound to the exact proposal contents and
-    expires/becomes invalid if those contents change.
--   [ ] Important actions are persisted in an audit log.
--   [ ] The UI clearly shows the request, recommendation, policy
-    outcome, approval status, and that no supplier order was submitted.
--   [ ] The project can be run and demonstrated reliably using
-    documented setup instructions.
+-   [x] Agent/customer identity is bound to server-authenticated tokens.
+    Configured category, line-quantity, and order-value limits are
+    enforced; spending/category limits are not invented when unset.
+-   [x] Complete proposals default to human approval before they can be
+    approved or rejected.
+-   [x] Approval is bound to the exact snapshot hash; changes invalidate
+    the decision, and duplicate/contradictory decisions are rejected.
+    Approvals do not currently expire on a timer.
+-   [x] Proposal, policy, approval, and audit events are persisted.
+    Approval and audit reads require a configured approver token.
+-   [x] The UI shows price/availability evidence, policy outcome, the
+    saved approval snapshot, and explicitly states that no order is sent.
+-   [x] Local setup and demo steps are documented; automated tests cover
+    the core flow and failure paths.
 
 ### Strong additions
 
--   [ ] MCP server exposes the same core procurement capabilities as the
-    REST API.
--   [ ] OpenAPI specification documents the external interface.
--   [ ] A future order adapter can use idempotency if a real order API
-    becomes available.
--   [ ] Partial availability and safe substitution flow is demonstrated.
--   [ ] Backend is deployed on Modal.
--   [ ] Aiven PostgreSQL is used for persistent application data and
-    audit records.
--   [ ] Gemini is used meaningfully for request interpretation,
-    constrained tool use, and explanations.
+-   [x] FastAPI publishes the REST contract as OpenAPI at `/openapi.json`
+    and Swagger UI at `/docs`.
+-   [deferred] MCP adapter; add only if an external MCP client is needed.
+-   [deferred] Supplier order adapter/idempotency; there is no order
+    endpoint to call or retry.
+-   [deferred] Automated substitution; the demo presents alternatives
+    for human review and never silently substitutes.
+-   [deferred] Modal deployment and Aiven PostgreSQL; local SQLite is
+    sufficient for the current challenge demo.
+-   [deferred] Gemini integration; deterministic interpretation is
+    currently safer and no model key/benefit is required for the core
+    flow.
+
+The deferred items are optional extensions, not blockers to the
+challenge's no-order-API demo. The next implementation scope should be
+driven by a concrete deployment or judging requirement rather than by
+the original speculative stack.
 
 ### Stretch goals only after the core is stable
 
@@ -214,7 +228,8 @@ invent allergen, origin, certification, stock, or sustainability facts.
     untrusted input.
 4.  Ask a clarification question if an essential field is missing or
     ambiguous (for example, quantity unit or delivery date).
-5.  Persist the request and an audit event.
+5.  Record an audit event with safe interpretation metadata. The current
+    demo does not store a separate raw-request record.
 6.  Return the structured interpretation to the UI for visibility.
 
 Do not silently default a missing product, quantity, sales unit, or
@@ -226,7 +241,9 @@ delivery date. Return clarification questions rather than guessing.
 2.  Retrieve details for plausible candidates.
 3.  Check price and availability for the correct customer/account and
     requested delivery date.
-4.  Normalize units and pack sizes before comparing prices.
+4.  Compare only offers with the same requested sales unit. Do not
+    convert units or infer pack-size equivalence unless the API defines
+    the conversion.
 5.  Exclude candidates that violate hard constraints.
 6.  Rank remaining candidates using transparent deterministic scoring or
     lexicographic rules.
@@ -237,6 +254,16 @@ The challenge API defines `catalogPrice` as price per sales unit and
 offers in the same requested sales unit and currency by their catalog
 price; show the comparison price separately and never compare KG against
 L or treat the comparison price as an order price.
+When a buyer supplies an exact catalog category code on a request line,
+filter candidates by that code before price and availability evaluation.
+For allergen exclusions, accept exact source IDs only; require an
+unambiguous `FREE_FROM` classification and reject contains, may-contain,
+undeclared, conflicting, or missing data. Do not infer allergen IDs from
+natural-language names because the supplied files provide no ID-to-name
+dictionary.
+Reject free-form hard constraints unless they are represented in a
+supported structured field; storing unparsed text is not evidence that a
+constraint was satisfied.
 
 Separate hard constraints from preferences: - Hard constraints: must be
 satisfied (e.g. explicit allergen exclusion, required delivery deadline,
@@ -451,39 +478,25 @@ end-to-end implementation.
 
 ## 12. Testing strategy
 
-Minimum automated tests:
+The automated suite uses deterministic catalog data and mocked supplier
+responses. It covers request parsing/clarification, category and
+allergen filtering, price ranking, availability and policy outcomes,
+429 cooldown behavior, approval authentication and snapshot integrity,
+audit persistence, and UI/API failure paths. There are deliberately no
+unit-conversion tests because the demo does not perform implicit
+conversions. A live mock API smoke check has also been performed; repeat
+it manually when supplier credentials or challenge data change.
 
-### Unit tests
+The test boundary must continue to verify that supplier failures,
+unknown availability, unauthorized calls, and incomplete proposals
+cannot be presented as confirmed orders. The challenge has no endpoint
+that can place or confirm one.
 
--   Request schema validation.
--   Unit/pack-size conversions.
--   Price and total calculations.
--   Product filtering and ranking.
--   Policy engine outcomes.
--   Approval snapshot matching.
+## 13. Original 48-hour execution schedule
 
-### Integration tests
-
--   Catalog search against the mock API.
--   Price and availability lookup.
--   Purchase-proposal validation.
--   Approval queue access, exact snapshot display, and token-protected decision.
--   Database persistence.
-
-### End-to-end demo tests
-
-1.  A complete proposal receives the configured policy outcome.
-2.  The default human-review requirement creates a pending approval.
-3.  Rejected approval remains rejected and does not create an order.
-4.  Modified proposal after approval fails the snapshot check.
-5.  Partial availability results in alternatives or a clear exception.
-6.  Supplier API failure does not produce a false success.
-7.  No endpoint or UI path claims supplier order submission.
-
-Use mock fixtures for repeatable tests, but verify the final demo
-against the actual supplied mock backend.
-
-## 13. 48-hour execution schedule
+This schedule is retained as hackathon planning history, not as a list of
+remaining implementation work. The core local demo milestones are
+complete; deployment and optional integrations are deferred above.
 
 ### Hours 0--6: API discovery and foundation
 

@@ -21,11 +21,22 @@ class ApprovalStatus(str, Enum):
     EXPIRED = "EXPIRED"
 
 
+def normalize_hard_constraints(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        constraint = value.strip()
+        if not constraint or len(constraint) > 500:
+            raise ValueError("hard constraints must contain 1 to 500 characters")
+        normalized.append(constraint)
+    return normalized
+
+
 class RequestLine(BaseModel):
     query: str = Field(..., min_length=1)
     quantity: Decimal = Field(..., gt=0)
     unit: str | None = None
     category: str | None = None
+    excluded_allergen_ids: list[str] = Field(default_factory=list, max_length=32)
     selected_product_id: str | None = None
 
     @field_validator("unit")
@@ -35,6 +46,26 @@ class RequestLine(BaseModel):
             return None
         return value.strip().upper()
 
+    @field_validator("category")
+    @classmethod
+    def normalize_category(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("excluded_allergen_ids")
+    @classmethod
+    def normalize_excluded_allergen_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            code = value.strip().upper()
+            if not code:
+                raise ValueError("excluded allergen IDs must not be blank")
+            if code not in normalized:
+                normalized.append(code)
+        return normalized
+
 
 class BuyerRequest(BaseModel):
     agent_id: str = Field(..., min_length=1)
@@ -42,7 +73,12 @@ class BuyerRequest(BaseModel):
     requested_date: date
     line_items: list[RequestLine] = Field(..., min_length=1)
     buyer_text: str | None = None
-    hard_constraints: list[str] = Field(default_factory=list)
+    hard_constraints: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("hard_constraints")
+    @classmethod
+    def normalize_hard_constraints(cls, values: list[str]) -> list[str]:
+        return normalize_hard_constraints(values)
 
 
 class CandidateProduct(BaseModel):
@@ -54,6 +90,7 @@ class CandidateProduct(BaseModel):
     base_unit: str | None = None
     allowed_lot_size: Decimal | None = None
     country_of_origin: str | None = None
+    allergen_classifications: dict[str, list[str]] = Field(default_factory=dict)
     relevance_score: int = 0
 
 

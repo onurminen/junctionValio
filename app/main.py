@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -32,6 +32,7 @@ from app.domain import (
     CandidateProduct,
     PurchasePlan,
     RequestLine,
+    normalize_hard_constraints,
 )
 from app.services.approval_service import ApprovalService
 from app.services.audit_service import AuditService
@@ -101,7 +102,12 @@ class PurchasePlanRequest(BaseModel):
     customer_id: str = "customer-001"
     requested_date: date
     line_items: list[RequestLine] = Field(..., min_length=1, max_length=100)
-    hard_constraints: list[str] = Field(default_factory=list)
+    hard_constraints: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("hard_constraints")
+    @classmethod
+    def validate_hard_constraints(cls, values: list[str]) -> list[str]:
+        return normalize_hard_constraints(values)
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -373,6 +379,33 @@ def _assess_candidate(
         and lot_size > 0
         and line.quantity % lot_size == 0
     )
+    category_matches = not line.category or candidate.get("category") == line.category
+    raw_allergen_classifications = candidate.get("allergen_classifications")
+    if not isinstance(raw_allergen_classifications, dict):
+        raw_allergen_classifications = {}
+    excluded_allergen_statuses: dict[str, str] = {}
+    for allergen_id in line.excluded_allergen_ids:
+        raw_relations = raw_allergen_classifications.get(allergen_id, [])
+        relations = {
+            relation.upper()
+            for relation in raw_relations
+            if isinstance(relation, str)
+        } if isinstance(raw_relations, list) else set()
+        if relations == {"FREE_FROM"}:
+            status = "FREE_FROM"
+        elif "CONTAINS" in relations:
+            status = "CONTAINS"
+        elif "MAY_CONTAIN" in relations:
+            status = "MAY_CONTAIN"
+        elif "UNDECLARED" in relations:
+            status = "UNDECLARED"
+        else:
+            status = "UNKNOWN"
+        excluded_allergen_statuses[allergen_id] = status
+    allergens_match = all(
+        status == "FREE_FROM"
+        for status in excluded_allergen_statuses.values()
+    )
     available_amount = _decimal_or_none(schedule.get("availableAmount"))
     available_date = schedule.get("availableDate")
     closing_time = availability.get("closingTime")
@@ -433,7 +466,14 @@ def _assess_candidate(
         "TERMINAL_AVAILABILITY_UNKNOWN",
         "CUTOFF_UNKNOWN",
     }
-    eligible = price_ok and unit_matches and lot_size_matches and availability_eligible
+    eligible = (
+        price_ok
+        and unit_matches
+        and lot_size_matches
+        and availability_eligible
+        and category_matches
+        and allergens_match
+    )
     reasons: list[str] = []
     if not price_ok:
         reasons.append("price is missing or invalid")
@@ -441,6 +481,13 @@ def _assess_candidate(
         reasons.append("requested unit does not match the product sales unit")
     if not lot_size_matches:
         reasons.append("quantity does not match the product's allowed lot size")
+    if not category_matches:
+        reasons.append("product category does not match the requested category")
+    for allergen_id, status in excluded_allergen_statuses.items():
+        if status != "FREE_FROM":
+            reasons.append(
+                f"excluded allergen code {allergen_id} is {status.lower().replace('_', ' ')}"
+            )
     if availability_status == "TERMINAL_AVAILABILITY_UNKNOWN":
         reasons.append("supplier availability is unknown; the quantity is not capped by this snapshot")
     elif availability_status == "CUTOFF_UNKNOWN":
@@ -452,6 +499,7 @@ def _assess_candidate(
         "product_id": candidate["product_id"],
         "name": candidate["name"],
         "category": candidate.get("category"),
+        "excluded_allergen_statuses": excluded_allergen_statuses,
         "relevance_score": candidate.get("relevance_score", 0),
         "sales_unit": sales_unit,
         "quantity": str(line.quantity),
@@ -588,15 +636,30 @@ def parse_request(
 
 
 @app.get("/api/catalog/search")
-def catalog_search(query: str, limit: int = 5) -> dict[str, Any]:
-    products = catalog_service.search(query, limit=limit)
+def catalog_search(
+    query: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(default=5, ge=1, le=50),
+    category: str | None = Query(default=None, max_length=64),
+    excluded_allergen_ids: list[str] | None = Query(default=None, max_length=32),
+) -> dict[str, Any]:
+    products = catalog_service.search(
+        query,
+        limit=limit,
+        category=category,
+        excluded_allergen_ids=excluded_allergen_ids,
+    )
     audit_service.record(
         actor="demo-user",
         action="catalog_searched",
         outcome="success" if products else "no_results",
         metadata={"result_count": len(products)},
     )
-    return {"query": query, "results": [product.model_dump(mode="json") for product in products]}
+    return {
+        "query": query,
+        "category": category,
+        "excluded_allergen_ids": excluded_allergen_ids or [],
+        "results": [product.model_dump(mode="json") for product in products],
+    }
 
 
 @app.post("/api/purchase-plan/build")
@@ -616,7 +679,12 @@ def build_purchase_plan(
 
     candidate_lists: list[list[dict[str, Any]]] = []
     for line in request.line_items:
-        matches = catalog_service.search(line.query, limit=5)
+        matches = catalog_service.search(
+            line.query,
+            limit=5,
+            category=line.category,
+            excluded_allergen_ids=line.excluded_allergen_ids,
+        )
         candidates = [candidate.model_dump(mode="json") for candidate in matches]
         if line.selected_product_id:
             selected = next(
@@ -723,6 +791,8 @@ def build_purchase_plan(
                 "query": line.query,
                 "quantity": str(line.quantity),
                 "unit": line.unit,
+                "category": line.category,
+                "excluded_allergen_ids": line.excluded_allergen_ids,
                 "selected_product_id": line.selected_product_id,
                 "status": "NO_ELIGIBLE_CANDIDATE",
                 "alternatives": assessments,
@@ -747,6 +817,9 @@ def build_purchase_plan(
             "name": selected["name"],
             "quantity": str(line.quantity),
             "unit": line.unit,
+            "category": line.category,
+            "excluded_allergen_ids": line.excluded_allergen_ids,
+            "excluded_allergen_statuses": selected["excluded_allergen_statuses"],
             "sales_unit": selected["sales_unit"],
             "unit_price": selected["unit_price"],
             "line_total": selected["line_total"],
@@ -905,5 +978,9 @@ def get_approval(
 
 
 @app.get("/api/audit")
-def list_audit_events(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+def list_audit_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    approver_token: str = Header(default="", alias="X-Approver-Token"),
+) -> dict[str, Any]:
+    _authenticated_approver(approver_token)
     return {"events": audit_service.list_events(limit)}

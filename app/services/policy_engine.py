@@ -89,6 +89,14 @@ class PolicyEngine:
             "agent_id": request.agent_id,
             "customer_id": request.customer_id,
             "line_count": len(request.line_items),
+            "line_constraints": [
+                {
+                    "query": line.query,
+                    "category": line.category,
+                    "excluded_allergen_ids": line.excluded_allergen_ids,
+                }
+                for line in request.line_items
+            ],
             "verified": verified,
             "total_value": str(total_value) if total_value is not None else "unknown",
             "currency": currency,
@@ -142,8 +150,11 @@ class PolicyEngine:
         ):
             reasons.append("external product category is outside the policy allow-list")
 
-        if request.hard_constraints and any("delivery" in constraint.lower() for constraint in request.hard_constraints):
-            facts["delivery_constraint_present"] = True
+        if request.hard_constraints:
+            facts["unverified_hard_constraint_count"] = len(request.hard_constraints)
+            reasons.append(
+                "buyer hard constraints must use supported structured fields so they can be verified"
+            )
 
         if reasons:
             return PolicyEvaluation(

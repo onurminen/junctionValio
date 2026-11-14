@@ -46,6 +46,7 @@
   <header>
     <h1>Trusted Trade</h1>
     <p>Product discovery and policy checks grounded in Valio Aimo challenge data.</p>
+    <p class="note"><strong>Proposal only:</strong> the challenge API has no order endpoint. Approval is recorded in Trusted Trade; nothing is sent to the supplier.</p>
   </header>
   <main>
     <section>
@@ -72,6 +73,12 @@
           <label>Sales unit code
             <input id="unit" placeholder="Choose from catalog results" required>
           </label>
+          <label>Required category code (optional)
+            <input id="category" placeholder="Use the exact catalog code">
+          </label>
+          <label>Excluded allergen source IDs (comma-separated)
+            <input id="excluded-allergen-codes" placeholder="Use exact IDs from catalog evidence">
+          </label>
           <label>Delivery date
             <input id="requested-date" type="date" required>
           </label>
@@ -91,7 +98,7 @@
           <button type="submit" id="build">Check price and availability</button>
         </div>
       </form>
-      <p class="note">Enter quantity in the product's sales unit. Unit codes are technical values from the catalog; no unit conversion is assumed. The agent token is required when server-side agent tokens are configured.</p>
+      <p class="note">Enter quantity in the product's sales unit. Category and allergen IDs must match exact catalog codes; only an explicit FREE_FROM relation satisfies an excluded-allergen constraint. Names are not automatically translated to codes. No unit conversion is assumed. The agent token is required when server-side tokens are configured.</p>
       <div id="unit-clarification" class="warning" hidden>
         <span id="unit-clarification-text"></span>
         <label class="unit-confirmation">
@@ -133,6 +140,7 @@
 
     <section class="wide">
       <h2>Audit timeline</h2>
+      <p class="note">Audit events are restricted to configured human approvers. Enter the approver token above to load them.</p>
       <label>Filter by actor, action, outcome, or ID
         <input id="audit-filter" type="search" placeholder="Type to filter recent events">
       </label>
@@ -159,6 +167,12 @@
         ...extra,
       };
     }
+    function excludedAllergenIds() {
+      return $("excluded-allergen-codes").value
+        .split(",")
+        .map((value) => value.trim().toUpperCase())
+        .filter(Boolean);
+    }
 
     $("query").addEventListener("input", () => {
       selectedProductId = null;
@@ -182,11 +196,15 @@
       const results = $("search-results");
       results.textContent = "Searching catalog…";
       try {
-        const query = encodeURIComponent($("query").value);
-        const body = await request(`/api/catalog/search?query=${query}&limit=5`);
+        const params = new URLSearchParams({ query: $("query").value, limit: "5" });
+        if ($("category").value.trim()) params.set("category", $("category").value.trim());
+        for (const allergenId of excludedAllergenIds()) {
+          params.append("excluded_allergen_ids", allergenId);
+        }
+        const body = await request(`/api/catalog/search?${params}`);
         results.replaceChildren();
         if (!body.results.length) {
-          results.textContent = "No catalog matches.";
+          results.textContent = "No catalog matches satisfy the category and allergen filters.";
           return;
         }
         for (const item of body.results) {
@@ -195,6 +213,12 @@
           const details = document.createElement("div");
           details.className = "candidate-details";
           details.textContent = `${item.name} · ID ${item.product_id} · sales unit ${item.sales_unit || "unknown"} · category ${item.category || "unknown"}`;
+          const allergenDetails = document.createElement("details");
+          const allergenSummary = document.createElement("summary");
+          allergenSummary.textContent = "Allergen source-code evidence";
+          const allergenData = document.createElement("pre");
+          allergenData.textContent = JSON.stringify(item.allergen_classifications || {}, null, 2);
+          allergenDetails.append(allergenSummary, allergenData);
           const button = document.createElement("button");
           button.type = "button";
           button.className = "secondary";
@@ -207,7 +231,7 @@
               candidateButton.textContent = candidateButton === button ? "Selected" : "Select";
             });
           });
-          row.append(details, button);
+          row.append(details, allergenDetails, button);
           results.append(row);
         }
       } catch (error) {
@@ -240,6 +264,9 @@
           quantity: $("quantity").value,
           unit: $("unit").value,
         };
+        if ($("category").value.trim()) line.category = $("category").value.trim();
+        const allergenIds = excludedAllergenIds();
+        if (allergenIds.length) line.excluded_allergen_ids = allergenIds;
         if (selectedProductId) line.selected_product_id = selectedProductId;
         const body = await request("/api/purchase-plan/build", {
           method: "POST",
@@ -279,10 +306,14 @@
             const comparison = option.comparison_price
               ? ` · comparison ${option.comparison_price} ${option.comparison_currency || option.currency || ""}/${option.comparison_unit}`
               : "";
+            const allergenEvidence = Object.entries(option.excluded_allergen_statuses || {})
+              .map(([code, status]) => `${code}: ${status}`)
+              .join(", ");
             details.textContent =
               `${option.name} · ${option.availability_status} · ${quantity} · ` +
               `price ${option.unit_price ?? "unknown"} ${option.currency ?? ""} per ${option.sales_unit || "unit"}` +
               comparison +
+              (allergenEvidence ? ` · excluded allergen checks ${allergenEvidence}` : "") +
               (option.closing_time ? ` · cutoff ${option.closing_time}` : "") +
               (option.review_reasons?.length ? ` · ${option.review_reasons.join("; ")}` : "");
             const button = document.createElement("button");
@@ -408,11 +439,18 @@
       const lines = document.createElement("ul");
       for (const line of snapshot.lines || []) {
         const item = document.createElement("li");
+        const allergenChecks = Object.entries(line.excluded_allergen_statuses || {})
+          .map(([code, status]) => `${code}: ${status}`)
+          .join(", ");
         item.textContent =
           `${line.name || line.query} · product ${line.product_id || "not selected"} · ` +
           `${line.quantity} ${line.unit || ""} · ${line.unit_price ?? "unknown"} ${line.currency ?? ""} per ${line.sales_unit || "sales unit"} · ` +
           `total ${line.line_total ?? "unknown"} ${line.currency ?? ""} · ` +
           `availability ${line.availability_status || line.status || "unknown"}` +
+          (line.category ? ` · required category ${line.category}` : "") +
+          (line.excluded_allergen_ids?.length
+            ? ` · excluded allergen IDs ${line.excluded_allergen_ids.join(", ")}${allergenChecks ? ` (${allergenChecks})` : ""}`
+            : "") +
           (line.comparison_price ? ` · comparison ${line.comparison_price} ${line.comparison_currency || line.currency || ""}/${line.comparison_unit}` : "") +
           (line.review_reasons?.length ? ` · ${line.review_reasons.join("; ")}` : "");
         lines.append(item);
@@ -515,6 +553,9 @@
       $("approval-queue").replaceChildren();
       $("approval-queue-status").textContent = "Token changed. Load the queue to authenticate again.";
       $("approval-queue-status").classList.remove("error");
+      auditEvents = [];
+      $("audit-output").textContent = "Token changed. Refresh the audit timeline to authenticate again.";
+      $("audit-output").classList.remove("error");
     });
 
     function renderAudit() {
@@ -554,12 +595,20 @@
     }
 
     async function refreshAudit() {
+      const output = $("audit-output");
+      output.classList.remove("error");
+      if (!$("approver-token").value.trim()) {
+        auditEvents = [];
+        output.textContent = "Enter the configured approver token to view audit events.";
+        return;
+      }
       try {
-        const body = await request("/api/audit?limit=20");
+        const body = await request("/api/audit?limit=20", { headers: approverHeaders() });
         auditEvents = body.events;
         renderAudit();
       } catch (error) {
-        $("audit-output").textContent = error.message;
+        output.textContent = error.message;
+        output.classList.add("error");
       }
     }
 

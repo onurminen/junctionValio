@@ -227,7 +227,10 @@ def test_request_interpretation_does_not_treat_a_budget_as_quantity() -> None:
     assert interpreted.line_items[0].quantity is None
 
 
-def test_catalog_search_returns_results() -> None:
+def test_catalog_search_returns_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:audit-secret")
     response = client.get(
         "/api/catalog/search",
         params={"query": "chocolate", "limit": 3},
@@ -238,16 +241,151 @@ def test_catalog_search_returns_results() -> None:
     payload = response.json()
     assert payload["results"]
     assert payload["results"][0]["product_id"]
-    events = client.get("/api/audit?limit=1").json()["events"]
+    events = client.get(
+        "/api/audit?limit=1",
+        headers={"X-Approver-Token": "audit-secret"},
+    ).json()["events"]
     assert events[0]["correlation_id"] == "corr-catalog-test"
+
+
+def test_catalog_search_filters_explicit_category() -> None:
+    from app.services.catalog_service import CatalogService
+
+    service = CatalogService()
+    unfiltered = service.search("chocolate", limit=20)
+    filtered = service.search("chocolate", limit=20, category="52200")
+
+    assert len({product.category for product in unfiltered}) > 1
+    assert filtered
+    assert all(product.category == "52200" for product in filtered)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"query": "chocolate", "limit": 0},
+        {"query": "chocolate", "limit": 51},
+        {"query": ""},
+        {"query": "x" * 201},
+    ],
+)
+def test_catalog_search_rejects_unbounded_inputs(params: dict[str, object]) -> None:
+    response = client.get("/api/catalog/search", params=params)
+    assert response.status_code == 422
+
+
+def test_catalog_search_requires_explicit_free_from_allergen_data() -> None:
+    from app.services.catalog_service import CatalogService
+
+    service = CatalogService()
+    unsafe_product = service.get_by_id("460000")
+    assert unsafe_product is not None
+    assert unsafe_product.allergen_classifications["AE"] == ["CONTAINS"]
+
+    results = service.search(
+        "chocolate",
+        limit=20,
+        excluded_allergen_ids=["AE"],
+    )
+    assert results
+    assert all(
+        product.allergen_classifications.get("AE") == ["FREE_FROM"]
+        for product in results
+    )
+    assert "460018" in {product.product_id for product in results}
+
+    unfiltered_unsafe_results = service.search(
+        unsafe_product.name,
+        limit=20,
+    )
+    assert "460000" in {product.product_id for product in unfiltered_unsafe_results}
+    unsafe_results = service.search(
+        unsafe_product.name,
+        limit=20,
+        excluded_allergen_ids=["AE"],
+    )
+    assert "460000" not in {product.product_id for product in unsafe_results}
+
+
+@pytest.mark.parametrize(
+    ("classifications", "eligible", "expected_status"),
+    [
+        ({"AE": ["FREE_FROM"]}, True, "FREE_FROM"),
+        ({"AE": ["CONTAINS"]}, False, "CONTAINS"),
+        ({"AE": ["MAY_CONTAIN"]}, False, "MAY_CONTAIN"),
+        ({"AE": ["UNDECLARED"]}, False, "UNDECLARED"),
+        ({}, False, "UNKNOWN"),
+        ({"AE": ["FREE_FROM", "CONTAINS"]}, False, "CONTAINS"),
+    ],
+)
+def test_candidate_allergen_constraints_fail_closed(
+    classifications: dict[str, list[str]],
+    eligible: bool,
+    expected_status: str,
+) -> None:
+    import app.main as main
+
+    line = RequestLine(
+        query="product",
+        quantity=Decimal("1"),
+        unit="KI",
+        excluded_allergen_ids=["ae"],
+    )
+    candidate = {
+        "product_id": "test-product",
+        "name": "Test product",
+        "category": "52200",
+        "sales_unit": "KI",
+        "allowed_lot_size": "1",
+        "allergen_classifications": classifications,
+    }
+    assessment = main._assess_candidate(
+        line=line,
+        candidate=candidate,
+        price={
+            "error": False,
+            "catalogPrice": {"value": "1", "currency": "EUR"},
+        },
+        availability={
+            "salesBlock": False,
+            "scheduleLines": [{
+                "salesBlock": False,
+                "availableAmount": 3,
+                "availableDate": "2026-11-16",
+                "salesUnit": "KI",
+            }],
+        },
+        availability_checked_at=None,
+        requested_date=date(2026, 11, 16),
+    )
+
+    assert assessment["eligible"] is eligible
+    assert assessment["excluded_allergen_statuses"] == {"AE": expected_status}
+
+
+def test_audit_api_requires_approver_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:audit-secret")
+    assert client.get("/api/audit").status_code == 401
+    response = client.get(
+        "/api/audit",
+        headers={"X-Approver-Token": "audit-secret"},
+    )
+    assert response.status_code == 200
 
 
 def test_demo_ui_and_audit_store_are_available(tmp_path) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert "Trusted Trade" in response.text
+    assert "nothing is sent to the supplier" in response.text
     assert "Human approval queue" in response.text
     assert 'id="approver-token"' in response.text
+    assert 'id="category"' in response.text
+    assert 'id="excluded-allergen-codes"' in response.text
     assert 'id="audit-filter"' in response.text
 
     store = Database(f"sqlite:///{tmp_path / 'audit.db'}")
@@ -315,6 +453,49 @@ def test_policy_engine_rejects_unconfigured_categories_and_wrong_customer() -> N
     ).evaluate(request, [{"category": "52200"}], Decimal("100"), True, "EUR")
     assert evaluation.decision == PolicyDecision.REJECTED
     assert any("not authorized" in reason for reason in evaluation.reasons)
+
+
+def test_policy_engine_rejects_unverified_free_form_hard_constraints() -> None:
+    request = BuyerRequest(
+        agent_id="demo-agent",
+        customer_id="customer-001",
+        requested_date="2026-11-16",
+        line_items=[RequestLine(query="milk", quantity=Decimal("1"), unit="KI")],
+        hard_constraints=["gluten-free"],
+    )
+    evaluation = PolicyEngine(
+        agent_customers={"demo-agent": {"customer-001"}},
+        allowed_categories={"52200"},
+        require_human_approval=False,
+    ).evaluate(request, [{"category": "52200"}], Decimal("10"), True, "EUR")
+
+    assert evaluation.decision == PolicyDecision.REJECTED
+    assert evaluation.facts["unverified_hard_constraint_count"] == 1
+    assert any("supported structured fields" in reason for reason in evaluation.reasons)
+
+
+def test_purchase_plan_rejects_blank_hard_constraint_before_supplier_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    class UnexpectedValioClient:
+        def __init__(self) -> None:
+            raise AssertionError("invalid constraints must be rejected before supplier calls")
+
+    monkeypatch.setattr(main, "ValioClient", UnexpectedValioClient)
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [{"query": "milk", "quantity": "1", "unit": "KI"}],
+            "hard_constraints": [" "],
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_approval_service_detects_snapshot_mismatch() -> None:
@@ -515,7 +696,13 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
             "agent_id": "demo-agent",
             "customer_id": "customer-001",
             "requested_date": "2026-11-16",
-            "line_items": [{"query": "chocolate", "quantity": "2", "unit": "KI"}],
+            "line_items": [{
+                "query": "chocolate",
+                "quantity": "2",
+                "unit": "KI",
+                "category": " 52200 ",
+                "excluded_allergen_ids": ["ae"],
+            }],
         },
         headers={"X-Agent-Token": "agent-secret"},
     )
@@ -530,6 +717,9 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
     assert plan["policy_version"] == body["policy"]["policy_version"]
     assert plan["policy_reasons"] == body["policy"]["reasons"]
     assert plan["policy_facts"]["human_approval_required"] is True
+    assert plan["lines"][0]["excluded_allergen_ids"] == ["AE"]
+    assert plan["lines"][0]["excluded_allergen_statuses"] == {"AE": "FREE_FROM"}
+    assert all(item["category"] == "52200" for item in plan["lines"][0]["alternatives"])
     first_alternative = next(
         item for item in plan["lines"][0]["alternatives"]
         if item["product_id"] == "460018"
