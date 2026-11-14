@@ -128,6 +128,7 @@ class ApprovalService:
             status=decision,
             approver=approver,
             created_at=row.created_at,
+            decided_at=decided_at,
             comment="approved" if approved else "rejected",
         )
 
@@ -144,6 +145,7 @@ class ApprovalService:
                     status=ApprovalStatus(row.status),
                     approver=row.approver,
                     created_at=row.created_at,
+                    decided_at=row.decided_at,
                     comment=row.comment,
                 )
                 for row in rows
@@ -162,6 +164,7 @@ class ApprovalService:
                     status=ApprovalStatus(row.status),
                     approver=row.approver,
                     created_at=row.created_at,
+                    decided_at=row.decided_at,
                     comment=row.comment,
                 ),
                 snapshot=json.loads(row.snapshot_json),

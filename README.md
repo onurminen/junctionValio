@@ -9,6 +9,7 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 - Deterministic policy engine with typed outcomes
 - SQL-backed purchase plan, approval, and audit records (SQLite by default)
 - Approval snapshot hashing, server-side snapshot lookup, and separate approver token
+- Approval records expose UTC request and human-decision timestamps
 - Manual multi-line proposal composition with per-line validation and alternatives
 - Small browser demo at `/`
 - OpenAPI documentation from FastAPI

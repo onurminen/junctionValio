@@ -409,6 +409,7 @@ def test_demo_ui_and_audit_store_are_available(tmp_path) -> None:
     assert "Product claims are not inferred" in response.text
     assert "Human approval queue" in response.text
     assert 'id="approver-token"' in response.text
+    assert "formatUtcTimestamp" in response.text
     assert 'id="category"' in response.text
     assert 'id="excluded-allergen-codes"' in response.text
     assert 'id="add-line"' in response.text
@@ -546,7 +547,14 @@ def test_approval_service_detects_snapshot_mismatch() -> None:
         service.decide(approval.approval_id, "human-approver", True)
 
 
-def test_approval_is_persisted_and_agent_cannot_approve_own_plan() -> None:
+@pytest.mark.parametrize(
+    ("approved", "expected_status"),
+    [(True, "APPROVED"), (False, "REJECTED")],
+)
+def test_approval_is_persisted_and_agent_cannot_approve_own_plan(
+    approved: bool,
+    expected_status: str,
+) -> None:
     store = Database("sqlite:///:memory:")
     snapshot = {
         "plan_id": "plan-2",
@@ -558,15 +566,25 @@ def test_approval_is_persisted_and_agent_cannot_approve_own_plan() -> None:
     service = ApprovalService(store, allowed_approvers={"human-approver"})
     approval = service.create_request("plan-2")
     assert len(service.list_records()) == 1
+    assert approval.created_at
+    assert approval.decided_at is None
+    assert service.list_records()[0].created_at == approval.created_at
     with pytest.raises(ValueError, match="cannot approve its own"):
         service.decide(approval.approval_id, "demo-agent", True)
-    decided = service.decide(approval.approval_id, "human-approver", True)
-    assert decided.status.value == "APPROVED"
+    decided = service.decide(approval.approval_id, "human-approver", approved)
+    assert decided.status.value == expected_status
+    assert decided.decided_at is not None
+    assert service.list_records()[0].decided_at == decided.decided_at
+    review = service.get_review(approval.approval_id)
+    assert review is not None
+    assert review.approval.created_at == approval.created_at
+    assert review.approval.decided_at == decided.decided_at
     with store.session() as session:
         persisted = session.get(ApprovalRow, approval.approval_id)
-        assert persisted.status == "APPROVED"
+        assert persisted.status == expected_status
+        assert persisted.decided_at == decided.decided_at
     with pytest.raises(ValueError, match="duplicate or contradictory"):
-        service.decide(approval.approval_id, "human-approver", False)
+        service.decide(approval.approval_id, "human-approver", not approved)
 
 
 def test_approval_api_requires_approver_token_and_persists_decision(
@@ -597,6 +615,8 @@ def test_approval_api_requires_approver_token_and_persists_decision(
     )
     assert requested.status_code == 200
     approval_id = requested.json()["approval"]["approval_id"]
+    assert requested.json()["approval"]["created_at"]
+    assert requested.json()["approval"]["decided_at"] is None
     monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:test-secret")
 
     assert client.get("/api/approvals").status_code == 401
@@ -607,6 +627,7 @@ def test_approval_api_requires_approver_token_and_persists_decision(
     review = client.get(f"/api/approvals/{approval_id}", headers=headers)
     assert review.status_code == 200
     assert review.json()["snapshot"] == snapshot
+    assert review.json()["approval"]["decided_at"] is None
     assert client.get(
         f"/api/approvals/{approval_id}",
         headers={"X-Approver-Token": "wrong"},
@@ -625,6 +646,9 @@ def test_approval_api_requires_approver_token_and_persists_decision(
     )
     assert response.status_code == 200
     assert response.json()["approval"]["status"] == "APPROVED"
+    assert response.json()["approval"]["decided_at"]
+    reviewed = client.get(f"/api/approvals/{approval_id}", headers=headers)
+    assert reviewed.json()["approval"]["decided_at"] == response.json()["approval"]["decided_at"]
     assert client.post(
         "/api/approvals/decide",
         json={**decision, "approver": "another-approver"},

@@ -133,6 +133,7 @@ class ApprovalRecord(BaseModel):
     status: ApprovalStatus
     approver: str | None = None
     created_at: str
+    decided_at: str | None = None
     comment: str | None = None
 
 

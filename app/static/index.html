@@ -556,6 +556,11 @@
       return { "X-Approver-Token": $("approver-token").value };
     }
 
+    function formatUtcTimestamp(value) {
+      const timestamp = new Date(value);
+      return Number.isNaN(timestamp.getTime()) ? "time unavailable" : timestamp.toISOString();
+    }
+
     function renderApproval(review) {
       const { approval, snapshot } = review;
       const card = document.createElement("article");
@@ -563,6 +568,11 @@
       const heading = document.createElement("h3");
       heading.textContent = `${approval.status} · ${approval.approval_id}`;
       card.append(heading);
+
+      const timing = document.createElement("p");
+      timing.className = "candidate-details";
+      timing.textContent = `Requested ${formatUtcTimestamp(approval.created_at)}`;
+      card.append(timing);
 
       const summary = document.createElement("p");
       summary.className = "candidate-details";
@@ -626,7 +636,10 @@
       } else if (approval.approver) {
         const decision = document.createElement("p");
         decision.className = "candidate-details";
-        decision.textContent = `Decision recorded by ${approval.approver}${approval.comment ? ` · ${approval.comment}` : ""}`;
+        decision.textContent =
+          `Decision recorded by ${approval.approver}` +
+          (approval.decided_at ? ` · ${formatUtcTimestamp(approval.decided_at)}` : "") +
+          (approval.comment ? ` · ${approval.comment}` : "");
         card.append(decision);
       }
 
@@ -675,7 +688,8 @@
           }),
         });
         $("approval-queue-status").textContent =
-          `Decision recorded: ${body.approval.status} by ${body.approval.approver}.`;
+          `Decision recorded: ${body.approval.status} by ${body.approval.approver}` +
+          (body.approval.decided_at ? ` at ${formatUtcTimestamp(body.approval.decided_at)}.` : ".");
         await refreshApprovals(true);
         await refreshAudit();
       } catch (error) {
