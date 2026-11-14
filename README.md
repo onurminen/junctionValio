@@ -9,6 +9,7 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 - Deterministic policy engine with typed outcomes
 - SQL-backed purchase plan, approval, and audit records (SQLite by default)
 - Approval snapshot hashing, server-side snapshot lookup, and separate approver token
+- Manual multi-line proposal composition with per-line validation and alternatives
 - Small browser demo at `/`
 - OpenAPI documentation from FastAPI
 - Safe fail-closed behavior when supplier credentials are absent
@@ -100,8 +101,10 @@ multiple agent/customer associations, use comma-separated
 - Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
 - Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
 - Listing approvals, reading their frozen snapshots, and reading the audit trail also require the approver token; decisions are bound to the identity matched from that token.
+- Approver authentication fails closed with a configuration error when tokens are missing or malformed.
 - The default policy does not invent category or spending restrictions; configure them only when buyer-specific rules are known.
-- The request interpreter handles one product line at a time, never fills missing quantity/date/sales unit with defaults, and requires manual splitting or clarification for ambiguous multi-item requests.
+- The request interpreter handles one product line at a time and never fills missing quantity/date/sales unit with defaults. For multi-item requests, it does not guess how quantities map to products; add each line separately in the UI before checking the combined proposal.
+- Catalog matches are keyword results only. Natural-language claims such as “lactose-free” are not verified product attributes; only supported structured catalog evidence can establish a constraint.
 - The planner checks a small static-catalog shortlist with batched price/availability API calls and exposes alternatives. Availability values `>= 999999` are reported as unknown, not as stock, and are sent for human review without applying a quantity cap from that sentinel. `closingTime` is checked against the API's `timeNow` for the associated `availableDate`.
 - Eligible alternatives are ranked by catalog price per matching sales unit; the API's kg/litre comparison price is shown separately and is never used to imply a unit conversion.
 - External callers can provide an exact catalog category code on a request line; candidate search and eligibility checks enforce it rather than treating it as a search keyword.

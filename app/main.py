@@ -95,6 +95,7 @@ class RequestInterpretationResponse(BaseModel):
     request: StructuredRequestInterpretation
     candidate_products: list[CandidateProduct]
     clarification_required: bool
+    warnings: list[str] = Field(default_factory=list)
 
 
 class PurchasePlanRequest(BaseModel):
@@ -251,10 +252,15 @@ def _extract_product_query(text: str) -> str | None:
 
 def _approver_tokens() -> dict[str, str]:
     tokens: dict[str, str] = {}
+    if not TRUSTED_TRADE_APPROVER_TOKENS:
+        return tokens
     for entry in TRUSTED_TRADE_APPROVER_TOKENS.split(","):
         approver, separator, token = entry.partition(":")
-        if separator and approver.strip() and token.strip():
-            tokens[approver.strip()] = token.strip()
+        approver = approver.strip()
+        token = token.strip()
+        if not separator or not approver or not token or approver in tokens:
+            raise HTTPException(status_code=503, detail="Approver token configuration is invalid")
+        tokens[approver] = token
     return tokens
 
 
@@ -299,10 +305,13 @@ def _authenticated_agent(token: str, requested_agent_id: str | None = None) -> s
 
 
 def _authenticated_approver(token: str) -> str:
+    tokens = _approver_tokens()
+    if not tokens:
+        raise HTTPException(status_code=503, detail="Approver authentication is not configured")
     token_bytes = token.encode("utf-8")
     matches = [
         approver
-        for approver, expected in _approver_tokens().items()
+        for approver, expected in tokens.items()
         if secrets.compare_digest(token_bytes, expected.encode("utf-8"))
     ]
     if len(matches) != 1 or matches[0] not in approval_service.allowed_approvers:
@@ -632,6 +641,10 @@ def parse_request(
         "request": request.model_dump(mode="json"),
         "candidate_products": [product.model_dump(mode="json") for product in choices],
         "clarification_required": bool(request.missing_fields),
+        "warnings": [
+            "Catalog matches are keyword results, not proof that natural-language product claims are satisfied.",
+            "Use supported structured category or allergen source-code constraints; unsupported product attributes remain unverified.",
+        ],
     }
 
 

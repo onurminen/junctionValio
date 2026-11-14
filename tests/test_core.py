@@ -47,6 +47,7 @@ def test_request_parser_finds_a_candidate_product() -> None:
     assert payload["request"]["line_items"][0]["unit"] is None
     assert payload["candidate_products"]
     assert payload["clarification_required"] is True
+    assert any("not proof" in warning for warning in payload["warnings"])
 
 
 def test_agent_token_binds_request_identity(
@@ -377,15 +378,41 @@ def test_audit_api_requires_approver_authentication(
     assert response.status_code == 200
 
 
+def test_approver_authentication_fails_closed_for_missing_or_invalid_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "")
+    assert client.get(
+        "/api/audit",
+        headers={"X-Approver-Token": "irrelevant"},
+    ).status_code == 503
+
+    monkeypatch.setattr(
+        main,
+        "TRUSTED_TRADE_APPROVER_TOKENS",
+        "human-approver:secret,malformed-entry",
+    )
+    response = client.get(
+        "/api/audit",
+        headers={"X-Approver-Token": "secret"},
+    )
+    assert response.status_code == 503
+
+
 def test_demo_ui_and_audit_store_are_available(tmp_path) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert "Trusted Trade" in response.text
     assert "nothing is sent to the supplier" in response.text
+    assert "Product claims are not inferred" in response.text
     assert "Human approval queue" in response.text
     assert 'id="approver-token"' in response.text
     assert 'id="category"' in response.text
     assert 'id="excluded-allergen-codes"' in response.text
+    assert 'id="add-line"' in response.text
+    assert 'id="staged-lines"' in response.text
     assert 'id="audit-filter"' in response.text
 
     store = Database(f"sqlite:///{tmp_path / 'audit.db'}")
@@ -726,6 +753,122 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
     )
     assert first_alternative["availability_status"] == "INSUFFICIENT_STOCK"
     assert "/api/orders/submit" not in app.openapi()["paths"]
+
+
+def test_purchase_plan_aggregates_multiple_product_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+    from app.domain import CandidateProduct
+
+    products = {
+        "milk": CandidateProduct(
+            product_id="milk-1",
+            name="Milk",
+            category="52200",
+            sales_unit="KI",
+            allowed_lot_size=Decimal("1"),
+        ),
+        "bread": CandidateProduct(
+            product_id="bread-1",
+            name="Bread",
+            category="52200",
+            sales_unit="KI",
+            allowed_lot_size=Decimal("1"),
+        ),
+    }
+
+    class CatalogStub:
+        def search(
+            self,
+            query: str,
+            limit: int = 5,
+            category: str | None = None,
+            excluded_allergen_ids: list[str] | None = None,
+        ) -> list[CandidateProduct]:
+            return [products[query]]
+
+    class MockValioClient:
+        def fetch_price(self, customer: str, requested_date, product_ids: list[str]) -> dict:
+            prices = {"milk-1": "2.50", "bread-1": "3.00"}
+            return {
+                "products": [
+                    {
+                        "productId": product_id,
+                        "error": False,
+                        "catalogPrice": {"value": prices[product_id], "currency": "EUR"},
+                    }
+                    for product_id in product_ids
+                ],
+            }
+
+        def fetch_availability(self, customer: str, requested_date, product_ids: list[str]) -> dict:
+            return {
+                "timeNow": "2026-11-14T14:00:00+0200",
+                "products": [
+                    {
+                        "productId": product_id,
+                        "closingTime": "2026-11-15T17:00:00+0200",
+                        "salesBlock": False,
+                        "scheduleLines": [{
+                            "salesBlock": False,
+                            "availableAmount": 20,
+                            "availableDate": "2026-11-16",
+                            "salesUnit": "KI",
+                        }],
+                    }
+                    for product_id in product_ids
+                ],
+            }
+
+    monkeypatch.setattr(main, "catalog_service", CatalogStub())
+    monkeypatch.setattr(main, "VALIO_API_KEY", "test-key")
+    monkeypatch.setattr(main, "ValioClient", MockValioClient)
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [
+                {"query": "milk", "quantity": "1", "unit": "KI"},
+                {"query": "bread", "quantity": "2", "unit": "KI"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    plan = response.json()["plan"]
+    assert [line["product_id"] for line in plan["lines"]] == ["milk-1", "bread-1"]
+    assert plan["total_value"] == "8.50"
+    assert plan["policy_decision"] == "PENDING_APPROVAL"
+
+
+def test_purchase_plan_rejects_more_than_100_lines_before_supplier_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    class UnexpectedValioClient:
+        def __init__(self) -> None:
+            raise AssertionError("oversized plans must be rejected before supplier calls")
+
+    monkeypatch.setattr(main, "VALIO_API_KEY", "test-key")
+    monkeypatch.setattr(main, "ValioClient", UnexpectedValioClient)
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [
+                {"query": f"product-{index}", "quantity": "1", "unit": "KI"}
+                for index in range(101)
+            ],
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_purchase_plan_prefers_lowest_eligible_price_per_sales_unit(

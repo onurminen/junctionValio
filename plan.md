@@ -45,8 +45,10 @@ or spend limits, so the prototype requires human approval by default.
 -   [x] Price and availability are checked for selected products,
     quantities, and delivery dates.
 -   [x] Request interpretation validates explicit values and asks for
-    missing or ambiguous fields. It intentionally supports one product
-    line at a time; it does not guess unit conversions.
+    missing or ambiguous fields. It intentionally interprets one product
+    line at a time; multi-line proposals are composed manually in the UI.
+    It does not guess unit conversions or infer product claims from
+    natural-language search terms.
 -   [x] Candidates are filtered by exact category/allergen source codes
     when provided and ranked by eligible EUR catalog price per matching
     sales unit. Allergen names are not translated to codes, and
@@ -228,9 +230,12 @@ invent allergen, origin, certification, stock, or sustainability facts.
     untrusted input.
 4.  Ask a clarification question if an essential field is missing or
     ambiguous (for example, quantity unit or delivery date).
-5.  Record an audit event with safe interpretation metadata. The current
+5.  If multiple products are detected, do not manufacture line items;
+    require the buyer to add each product and quantity separately in the
+    plan builder.
+6.  Record an audit event with safe interpretation metadata. The current
     demo does not store a separate raw-request record.
-6.  Return the structured interpretation to the UI for visibility.
+7.  Return the structured interpretation to the UI for visibility.
 
 Do not silently default a missing product, quantity, sales unit, or
 delivery date. Return clarification questions rather than guessing.
@@ -480,7 +485,8 @@ end-to-end implementation.
 
 The automated suite uses deterministic catalog data and mocked supplier
 responses. It covers request parsing/clarification, category and
-allergen filtering, price ranking, availability and policy outcomes,
+allergen filtering, single- and multi-line plan aggregation, price
+ranking, availability and policy outcomes,
 429 cooldown behavior, approval authentication and snapshot integrity,
 audit persistence, and UI/API failure paths. There are deliberately no
 unit-conversion tests because the demo does not perform implicit

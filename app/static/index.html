@@ -28,6 +28,7 @@
     .candidate { display: flex; justify-content: space-between; align-items: flex-start; gap: .8rem; border-top: 1px solid #e6eceb; padding: .7rem 0; }
     .candidate button { flex: 0 0 auto; padding: .45rem .65rem; }
     .candidate-details { font-size: .84rem; line-height: 1.45; }
+    .staged-line { display: flex; justify-content: space-between; align-items: center; gap: .75rem; margin: .4rem 0; }
     .approval-card { border: 1px solid #dfe6e7; border-radius: 9px; padding: .9rem; margin-top: .8rem; }
     .approval-card h3 { margin: 0 0 .45rem; font-size: .98rem; }
     .approval-card ul { margin: .4rem 0; padding-left: 1.2rem; }
@@ -54,6 +55,7 @@
       <label>Describe what you need
         <textarea id="buyer-text" placeholder="Example: I need 1,000 litres of lactose-free milk by Monday."></textarea>
       </label>
+      <p class="note"><strong>Product claims are not inferred:</strong> terms such as “lactose-free” are search text, not verified attributes. Use supported exact catalog codes where available; otherwise treat the claim as unverified and do not assume a match satisfies it.</p>
       <div class="actions">
         <button type="button" class="secondary" id="interpret-request">Extract request details</button>
       </div>
@@ -95,10 +97,11 @@
         <div class="actions">
           <button type="button" class="secondary" id="search">Search catalog</button>
           <button type="button" class="secondary" id="compare">Compare shortlist</button>
-          <button type="submit" id="build">Check price and availability</button>
+          <button type="button" class="secondary" id="add-line">Add line to plan</button>
+          <button type="button" id="build">Check price and availability</button>
         </div>
       </form>
-      <p class="note">Enter quantity in the product's sales unit. Category and allergen IDs must match exact catalog codes; only an explicit FREE_FROM relation satisfies an excluded-allergen constraint. Names are not automatically translated to codes. No unit conversion is assumed. The agent token is required when server-side tokens are configured.</p>
+      <p class="note">Add each product line separately, then check the combined plan. Enter quantity in each product's sales unit. Category and allergen IDs must match exact catalog codes; only an explicit FREE_FROM relation satisfies an excluded-allergen constraint. Names are not automatically translated to codes. No unit conversion is assumed. The agent token is required when server-side tokens are configured.</p>
       <div id="unit-clarification" class="warning" hidden>
         <span id="unit-clarification-text"></span>
         <label class="unit-confirmation">
@@ -106,6 +109,7 @@
           I have converted or confirmed the quantity in the selected sales unit.
         </label>
       </div>
+      <div id="staged-lines" class="note" aria-live="polite">No product lines staged.</div>
       <div id="search-results" class="note" aria-live="polite"></div>
     </section>
 
@@ -155,9 +159,10 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let lastPlan = null;
+    let stagedLines = [];
     let selectedProductId = null;
     let interpretedUnitText = null;
-    let multipleItemsDetected = false;
+    let manualSplitRequired = false;
     let requiresUnitConfirmation = false;
     let auditEvents = [];
     function agentHeaders(extra = {}) {
@@ -174,12 +179,99 @@
         .filter(Boolean);
     }
 
+    function currentLineHasInput() {
+      return Boolean(
+        $("query").value.trim() ||
+        $("quantity").value ||
+        $("unit").value.trim() ||
+        $("category").value.trim() ||
+        $("excluded-allergen-codes").value.trim() ||
+        selectedProductId
+      );
+    }
+
+    function currentLine() {
+      const line = {
+        query: $("query").value.trim(),
+        quantity: $("quantity").value,
+        unit: $("unit").value.trim(),
+      };
+      if ($("category").value.trim()) line.category = $("category").value.trim();
+      const allergenIds = excludedAllergenIds();
+      if (allergenIds.length) line.excluded_allergen_ids = allergenIds;
+      if (selectedProductId) line.selected_product_id = selectedProductId;
+      return line;
+    }
+
+    function invalidatePlan() {
+      const hadPlan = Boolean(lastPlan);
+      lastPlan = null;
+      $("plan-status").classList.remove("error");
+      $("approval-request").hidden = true;
+      $("approval-output").textContent = "";
+      $("plan-output").hidden = true;
+      $("alternatives").replaceChildren();
+      if (hadPlan) {
+        $("plan-status").textContent = "Inputs changed. Recheck price and availability before requesting approval.";
+      }
+    }
+
+    function renderStagedLines() {
+      const container = $("staged-lines");
+      container.replaceChildren();
+      if (!stagedLines.length) {
+        container.textContent = "No product lines staged.";
+        return;
+      }
+      const list = document.createElement("ol");
+      stagedLines.forEach((line, index) => {
+        const item = document.createElement("li");
+        item.className = "staged-line";
+        const summary = document.createElement("span");
+        summary.textContent =
+          `${line.query} · ${line.quantity} ${line.unit}` +
+          (line.category ? ` · category ${line.category}` : "") +
+          (line.excluded_allergen_ids?.length
+            ? ` · excludes ${line.excluded_allergen_ids.join(", ")}`
+            : "");
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "secondary";
+        remove.textContent = "Remove";
+        remove.addEventListener("click", () => {
+          stagedLines.splice(index, 1);
+          renderStagedLines();
+          invalidatePlan();
+        });
+        item.append(summary, remove);
+        list.append(item);
+      });
+      container.append(list);
+    }
+
+    function clearCurrentLine() {
+      $("query").value = "";
+      $("quantity").value = "";
+      $("unit").value = "";
+      $("category").value = "";
+      $("excluded-allergen-codes").value = "";
+      $("unit-confirmed").checked = false;
+      $("unit-clarification").hidden = true;
+      $("search-results").replaceChildren();
+      $("search-results").classList.remove("error");
+      selectedProductId = null;
+      interpretedUnitText = null;
+      requiresUnitConfirmation = false;
+    }
+
     $("query").addEventListener("input", () => {
       selectedProductId = null;
       $("unit-confirmed").checked = false;
     });
     $("quantity").addEventListener("input", () => { $("unit-confirmed").checked = false; });
     $("unit").addEventListener("input", () => { $("unit-confirmed").checked = false; });
+    $("plan-form").addEventListener("input", invalidatePlan);
+    $("buyer-text").addEventListener("input", invalidatePlan);
 
     async function request(url, options = {}) {
       const response = await fetch(url, options);
@@ -194,6 +286,7 @@
 
     $("search").addEventListener("click", async () => {
       const results = $("search-results");
+      results.classList.remove("error");
       results.textContent = "Searching catalog…";
       try {
         const params = new URLSearchParams({ query: $("query").value, limit: "5" });
@@ -227,6 +320,7 @@
             selectedProductId = item.product_id;
             $("unit").value = item.sales_unit || "";
             $("unit-confirmed").checked = false;
+            invalidatePlan();
             results.querySelectorAll("button").forEach((candidateButton) => {
               candidateButton.textContent = candidateButton === button ? "Selected" : "Select";
             });
@@ -240,34 +334,63 @@
       }
     });
 
-    async function buildPlan() {
+    function stageCurrentLine() {
+      $("plan-status").classList.remove("error");
       if (!$("plan-form").reportValidity()) return;
-      if (multipleItemsDetected) {
-        $("plan-status").textContent =
-          "This screen handles one product line at a time. Split the request before building a plan.";
+      if (stagedLines.length >= 100) {
+        $("plan-status").textContent = "A purchase plan may contain at most 100 product lines.";
         return;
       }
       if (requiresUnitConfirmation && !$("unit-confirmed").checked) {
         $("plan-status").textContent = interpretedUnitText
-          ? `The request specified ${interpretedUnitText}. Confirm or convert the quantity to the selected catalog sales unit before checking availability.`
-          : "The request did not specify a sales unit. Confirm the quantity in the selected catalog sales unit before checking availability.";
+          ? `Confirm or convert ${interpretedUnitText} to the selected catalog sales unit before adding this line.`
+          : "Confirm the quantity in the selected catalog sales unit before adding this line.";
         return;
       }
+      stagedLines.push(currentLine());
+      renderStagedLines();
+      clearCurrentLine();
+      invalidatePlan();
+      $("plan-status").textContent = `${stagedLines.length} line(s) staged. Add another line or check the combined plan.`;
+    }
+
+    async function buildPlan(selection = null) {
+      for (const id of ["requested-date", "agent", "customer"]) {
+        if (!$(id).reportValidity()) return;
+      }
+      const lines = stagedLines.map((line) => ({ ...line }));
+      if (!stagedLines.length || currentLineHasInput()) {
+        if (!$("plan-form").reportValidity()) return;
+        if (requiresUnitConfirmation && !$("unit-confirmed").checked) {
+          $("plan-status").textContent = interpretedUnitText
+            ? `The request specified ${interpretedUnitText}. Confirm or convert the quantity to the selected catalog sales unit before checking availability.`
+            : "Confirm the quantity in the selected catalog sales unit before checking availability.";
+          return;
+        }
+        if (lines.length >= 100) {
+          $("plan-status").textContent = "A purchase plan may contain at most 100 product lines.";
+          return;
+        }
+        lines.push(currentLine());
+      }
+      if (!lines.length) {
+        $("plan-status").textContent =
+          "Add at least one product line before checking the plan.";
+        return;
+      }
+      if (manualSplitRequired && lines.length < 2) {
+        $("plan-status").textContent =
+          "The interpreted request mentioned multiple products. Add each product as a separate line before checking the plan.";
+        return;
+      }
+      if (selection) lines[selection.lineIndex].selected_product_id = selection.productId;
       $("build").disabled = true;
+      $("plan-status").classList.remove("error");
       $("plan-status").textContent = "Checking price and availability…";
       $("approval-request").hidden = true;
       $("approval-output").textContent = "";
       $("alternatives").replaceChildren();
       try {
-        const line = {
-          query: $("query").value,
-          quantity: $("quantity").value,
-          unit: $("unit").value,
-        };
-        if ($("category").value.trim()) line.category = $("category").value.trim();
-        const allergenIds = excludedAllergenIds();
-        if (allergenIds.length) line.excluded_allergen_ids = allergenIds;
-        if (selectedProductId) line.selected_product_id = selectedProductId;
         const body = await request("/api/purchase-plan/build", {
           method: "POST",
           headers: agentHeaders({ "Content-Type": "application/json" }),
@@ -275,7 +398,7 @@
             agent_id: $("agent").value,
             customer_id: $("customer").value,
             requested_date: $("requested-date").value,
-            line_items: [line],
+            line_items: lines,
           }),
         });
         lastPlan = body.plan;
@@ -291,7 +414,7 @@
             : "review the availability state and alternatives before approving.") +
           (selectionReasons.length ? ` ${selectionReasons.join(". ")}.` : "");
         $("approval-request").hidden = body.policy.decision !== "PENDING_APPROVAL";
-        for (const orderLine of body.plan.lines) {
+        for (const [lineIndex, orderLine] of body.plan.lines.entries()) {
           const heading = document.createElement("h3");
           heading.textContent = `Alternatives for ${orderLine.query}`;
           $("alternatives").append(heading);
@@ -322,10 +445,7 @@
             button.textContent = option.eligible ? "Use this option" : "Not eligible";
             button.disabled = !option.eligible;
             button.addEventListener("click", () => {
-              selectedProductId = option.product_id;
-              $("unit").value = option.sales_unit || "";
-              $("unit-confirmed").checked = false;
-              buildPlan();
+              buildPlan({ lineIndex, productId: option.product_id });
             });
             row.append(details, button);
             $("alternatives").append(row);
@@ -344,9 +464,17 @@
       event.preventDefault();
       await buildPlan();
     });
+    $("add-line").addEventListener("click", stageCurrentLine);
+    $("build").addEventListener("click", () => buildPlan());
 
     $("interpret-request").addEventListener("click", async () => {
       const button = $("interpret-request");
+      if (stagedLines.length) {
+        $("interpretation-output").hidden = false;
+        $("interpretation-output").textContent =
+          "Remove staged lines before interpreting a different request.";
+        return;
+      }
       if (!$("buyer-text").value.trim()) {
         $("interpretation-output").hidden = false;
         $("interpretation-output").textContent = "Enter a request to interpret.";
@@ -366,24 +494,32 @@
           body: JSON.stringify(payload),
         });
         const line = body.request.line_items[0] || {};
-        $("query").value = line.query || "";
-        $("quantity").value = line.quantity ?? "";
-        $("unit").value = line.unit || "";
         $("requested-date").value = body.request.requested_date || "";
-        selectedProductId = null;
-        interpretedUnitText = line.requested_unit_text || null;
-        multipleItemsDetected = body.request.multiple_items_detected;
-        requiresUnitConfirmation = true;
-        $("unit-confirmed").checked = false;
-        $("unit-clarification").hidden = false;
-        $("unit-clarification-text").textContent = interpretedUnitText
-          ? `The request said ${line.quantity ?? "an unspecified quantity"} ${interpretedUnitText}; the app will not convert it to a catalog sales unit.`
-          : "The request did not specify a quantity unit. Confirm the selected catalog sales unit; no conversion is applied.";
+        manualSplitRequired = body.request.multiple_items_detected;
+        if (manualSplitRequired) {
+          clearCurrentLine();
+          $("plan-status").textContent =
+            "The interpreter found multiple products but will not guess their separate quantities. Add each product as its own line.";
+        } else {
+          $("query").value = line.query || "";
+          $("quantity").value = line.quantity ?? "";
+          $("unit").value = line.unit || "";
+          selectedProductId = null;
+          interpretedUnitText = line.requested_unit_text || null;
+          requiresUnitConfirmation = true;
+          $("unit-confirmed").checked = false;
+          $("unit-clarification").hidden = false;
+          $("unit-clarification-text").textContent = interpretedUnitText
+            ? `The request said ${line.quantity ?? "an unspecified quantity"} ${interpretedUnitText}; the app will not convert it to a catalog sales unit.`
+            : "The request did not specify a quantity unit. Confirm the selected catalog sales unit; no conversion is applied.";
+        }
+        invalidatePlan();
         $("interpretation-output").hidden = false;
         $("interpretation-output").textContent = JSON.stringify({
           structured_request: body.request,
           candidate_products: body.candidate_products,
           clarification_required: body.clarification_required,
+          warnings: body.warnings,
         }, null, 2);
       } catch (error) {
         $("interpretation-output").hidden = false;
