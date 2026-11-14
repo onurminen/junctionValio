@@ -571,7 +571,9 @@
 
       const timing = document.createElement("p");
       timing.className = "candidate-details";
-      timing.textContent = `Requested ${formatUtcTimestamp(approval.created_at)}`;
+      timing.textContent =
+        `Requested ${formatUtcTimestamp(approval.created_at)} · ` +
+        `Expires ${formatUtcTimestamp(approval.expires_at)}`;
       card.append(timing);
 
       const summary = document.createElement("p");

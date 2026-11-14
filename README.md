@@ -9,7 +9,7 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 - Deterministic policy engine with typed outcomes
 - SQL-backed purchase plan, approval, and audit records (SQLite by default)
 - Approval snapshot hashing, server-side snapshot lookup, and separate approver token
-- Approval records expose UTC request and human-decision timestamps
+- Approval records expose UTC request, expiry, and human-decision timestamps; pending approvals expire after 24 hours by default
 - Manual multi-line proposal composition with per-line validation and alternatives
 - Small browser demo at `/`
 - OpenAPI documentation from FastAPI
@@ -35,6 +35,7 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
    # VALIO_BASE_URL defaults to https://junction26.valioaimo.fi
    # set TRUSTED_TRADE_ALLOWED_CATEGORIES to buyer-approved category codes
    # configure private agent and approver tokens before enabling protected actions
+   # optionally set TRUSTED_TRADE_APPROVAL_TTL_HOURS (default: 24; range: 1-8760)
 
    Generate each private token locally with:
 
@@ -101,6 +102,7 @@ multiple agent/customer associations, use comma-separated
 - The browser includes an authenticated approval queue that displays the frozen snapshot and policy rationale before approve/reject. The approver token is entered at runtime and is not stored by the page.
 - Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
 - Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
+- Pending approvals expire after `TRUSTED_TRADE_APPROVAL_TTL_HOURS` (default 24 hours, integer range 1–8760). Expiration is applied when an authenticated approver lists, reads, or decides approvals; late decisions return HTTP 409, and each transition is recorded in the audit trail. Expiry is derived from the existing UTC creation timestamp, so it requires no database migration.
 - Listing approvals, reading their frozen snapshots, and reading the audit trail also require the approver token; decisions are bound to the identity matched from that token.
 - Approver authentication fails closed with a configuration error when tokens are missing or malformed.
 - The default policy does not invent category or spending restrictions; configure them only when buyer-specific rules are known.

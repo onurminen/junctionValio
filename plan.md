@@ -62,8 +62,11 @@ or spend limits, so the prototype requires human approval by default.
     approved or rejected.
 -   [x] Approval is bound to the exact snapshot hash; changes invalidate
     the decision, and duplicate/contradictory decisions are rejected.
-    Approver identity and UTC request/decision timestamps are returned;
-    approvals do not currently expire on a timer.
+    Approver identity and UTC request/expiry/decision timestamps are
+    returned. Pending approvals expire after a configurable lifetime
+    (24 hours by default); authenticated queue/detail/decision access
+    applies overdue transitions, late decisions fail with HTTP 409, and
+    expiration is audited.
 -   [x] Proposal, policy, approval, and audit events are persisted.
     Approval and audit reads require a configured approver token.
 -   [x] The UI shows price/availability evidence, policy outcome, the

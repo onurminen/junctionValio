@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from uuid import uuid4
@@ -14,7 +14,7 @@ from app.domain import BuyerRequest, PolicyDecision, RequestLine
 from app.database import ApprovalRow, Database, PurchasePlanRow
 from app.database import database
 from app.main import app
-from app.services.approval_service import ApprovalService
+from app.services.approval_service import ApprovalExpiredError, ApprovalService
 from app.services.audit_service import AuditService
 from app.services.policy_engine import PolicyEngine
 
@@ -410,6 +410,7 @@ def test_demo_ui_and_audit_store_are_available(tmp_path) -> None:
     assert "Human approval queue" in response.text
     assert 'id="approver-token"' in response.text
     assert "formatUtcTimestamp" in response.text
+    assert "approval.expires_at" in response.text
     assert 'id="category"' in response.text
     assert 'id="excluded-allergen-codes"' in response.text
     assert 'id="add-line"' in response.text
@@ -587,6 +588,68 @@ def test_approval_is_persisted_and_agent_cannot_approve_own_plan(
         service.decide(approval.approval_id, "human-approver", not approved)
 
 
+@pytest.mark.parametrize("configured_ttl", ["0", "-1", "8761", "not-an-integer"])
+def test_approval_ttl_configuration_rejects_invalid_values(
+    configured_ttl: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.approval_service as approval_module
+
+    monkeypatch.setattr(
+        approval_module,
+        "TRUSTED_TRADE_APPROVAL_TTL_HOURS",
+        configured_ttl,
+    )
+    with pytest.raises(ValueError, match="approval TTL"):
+        ApprovalService(Database("sqlite:///:memory:"))
+
+
+def test_approval_ttl_defaults_to_24_hours() -> None:
+    service = ApprovalService(Database("sqlite:///:memory:"))
+    assert service.approval_ttl == timedelta(hours=24)
+
+
+def test_expired_approval_cannot_be_decided() -> None:
+    store = Database("sqlite:///:memory:")
+    snapshot = {
+        "plan_id": "plan-expired",
+        "agent_id": "demo-agent",
+        "customer_id": "customer-001",
+        "lines": [{"query": "chocolate"}],
+    }
+    store.save_plan(
+        "plan-expired",
+        snapshot,
+        "PENDING_APPROVAL",
+        "demo-agent",
+        "customer-001",
+    )
+    service = ApprovalService(
+        store,
+        allowed_approvers={"human-approver"},
+        approval_ttl=timedelta(hours=1),
+    )
+    approval = service.create_request("plan-expired")
+    expired_created_at = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    ).isoformat()
+    with store.session() as session, session.begin():
+        row = session.get(ApprovalRow, approval.approval_id)
+        row.created_at = expired_created_at
+
+    expected_expiry = (datetime.fromisoformat(expired_created_at) + timedelta(hours=1)).isoformat()
+    with pytest.raises(ApprovalExpiredError) as expired_error:
+        service.decide(approval.approval_id, "human-approver", True)
+    assert expired_error.value.transitioned is True
+    expired = service.list_records()[0]
+    assert expired.status.value == "EXPIRED"
+    assert expired.expires_at == expected_expiry
+    assert service.expire_overdue() == []
+    with pytest.raises(ApprovalExpiredError) as repeated_error:
+        service.decide(approval.approval_id, "human-approver", True)
+    assert repeated_error.value.transitioned is False
+
+
 def test_approval_api_requires_approver_token_and_persists_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -659,6 +722,90 @@ def test_approval_api_requires_approver_token_and_persists_decision(
         json={**decision, "approved": False},
         headers=headers,
     ).status_code == 409
+
+
+def test_approval_api_expires_and_audits_overdue_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    store = Database("sqlite:///:memory:")
+    plan_id = "plan-expired-api"
+    snapshot = {
+        "plan_id": plan_id,
+        "agent_id": "demo-agent",
+        "customer_id": "customer-001",
+        "lines": [],
+    }
+    store.save_plan(plan_id, snapshot, "PENDING_APPROVAL", "demo-agent", "customer-001")
+    detail_plan_id = "plan-expired-detail"
+    store.save_plan(
+        detail_plan_id,
+        {
+            "plan_id": detail_plan_id,
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "lines": [],
+        },
+        "PENDING_APPROVAL",
+        "demo-agent",
+        "customer-001",
+    )
+    service = ApprovalService(
+        store,
+        allowed_approvers={"human-approver"},
+        approval_ttl=timedelta(hours=1),
+    )
+    audit = AuditService(store)
+    approval = service.create_request(plan_id)
+    detail_approval = service.create_request(detail_plan_id)
+    expired_created_at = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    ).isoformat()
+    with store.session() as session, session.begin():
+        for approval_id in (approval.approval_id, detail_approval.approval_id):
+            row = session.get(ApprovalRow, approval_id)
+            row.created_at = expired_created_at
+
+    monkeypatch.setattr(main, "approval_service", service)
+    monkeypatch.setattr(main, "audit_service", audit)
+    monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:test-secret")
+    headers = {"X-Approver-Token": "test-secret"}
+
+    detail = client.get(
+        f"/api/approvals/{detail_approval.approval_id}",
+        headers=headers,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["approval"]["status"] == "EXPIRED"
+    listed = client.get("/api/approvals", headers=headers)
+    assert listed.status_code == 200
+    record = next(
+        item for item in listed.json()["approvals"]
+        if item["approval_id"] == approval.approval_id
+    )
+    assert record["status"] == "EXPIRED"
+    review = client.get(f"/api/approvals/{approval.approval_id}", headers=headers)
+    assert review.status_code == 200
+    assert review.json()["approval"]["status"] == "EXPIRED"
+    decision = client.post(
+        "/api/approvals/decide",
+        json={
+            "approval_id": approval.approval_id,
+            "approver": "human-approver",
+            "approved": True,
+        },
+        headers=headers,
+    )
+    assert decision.status_code == 409
+    events = [
+        event for event in audit.list_events()
+        if event["entity_id"] in {approval.approval_id, detail_approval.approval_id}
+        and event["action"] == "approval_expired"
+    ]
+    assert len(events) == 2
+    assert all(event["outcome"] == "EXPIRED" for event in events)
+    assert all(event["metadata"]["expires_at"] for event in events)
 
 
 def test_approval_request_is_limited_to_plan_owner(

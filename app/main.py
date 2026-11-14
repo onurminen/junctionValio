@@ -34,7 +34,7 @@ from app.domain import (
     RequestLine,
     normalize_hard_constraints,
 )
-from app.services.approval_service import ApprovalService
+from app.services.approval_service import ApprovalExpiredError, ApprovalService
 from app.services.audit_service import AuditService
 from app.services.catalog_service import CatalogService
 from app.services.policy_engine import PolicyEngine
@@ -45,6 +45,25 @@ catalog_service = CatalogService()
 policy_engine = PolicyEngine()
 approval_service = ApprovalService()
 audit_service = AuditService()
+
+
+def _record_expired_approval(approval_id: str) -> None:
+    review = approval_service.get_review(approval_id)
+    audit_service.record(
+        actor="system",
+        action="approval_expired",
+        outcome="EXPIRED",
+        entity_type="approval",
+        entity_id=approval_id,
+        metadata={"expires_at": review.approval.expires_at if review is not None else None},
+    )
+
+
+def _expire_approvals(approval_id: str | None = None) -> list[str]:
+    expired_ids = approval_service.expire_overdue(approval_id)
+    for expired_id in expired_ids:
+        _record_expired_approval(expired_id)
+    return expired_ids
 
 
 @app.middleware("http")
@@ -957,6 +976,8 @@ def decide_approval(
     authenticated_approver = _authenticated_approver(approver_token)
     if payload.approver != authenticated_approver:
         raise HTTPException(status_code=403, detail="Approver identity does not match the token")
+    if payload.approval_id in _expire_approvals(payload.approval_id):
+        raise HTTPException(status_code=409, detail="approval request has expired")
     try:
         approval = approval_service.decide(
             payload.approval_id,
@@ -965,6 +986,10 @@ def decide_approval(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalExpiredError as exc:
+        if exc.transitioned:
+            _record_expired_approval(payload.approval_id)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit_service.record(
@@ -984,6 +1009,7 @@ def list_approvals(
     approver_token: str = Header(default="", alias="X-Approver-Token"),
 ) -> dict[str, Any]:
     _authenticated_approver(approver_token)
+    _expire_approvals()
     return {
         "approvals": [
             record.model_dump(mode="json")
@@ -998,6 +1024,7 @@ def get_approval(
     approver_token: str = Header(default="", alias="X-Approver-Token"),
 ) -> dict[str, Any]:
     _authenticated_approver(approver_token)
+    _expire_approvals(approval_id)
     review = approval_service.get_review(approval_id)
     if review is None:
         raise HTTPException(status_code=404, detail="approval request not found")
