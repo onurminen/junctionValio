@@ -720,7 +720,21 @@ def build_purchase_plan(
     price_by_id: dict[str, dict[str, Any]] = {}
     availability_by_id: dict[str, dict[str, Any]] = {}
 
-    if product_ids and VALIO_API_KEY:
+    if product_ids and not VALIO_API_KEY:
+        audit_service.record(
+            actor=request.agent_id,
+            action="price_availability_checked",
+            outcome="credentials_missing",
+            entity_type="customer",
+            entity_id=request.customer_id,
+            metadata={"candidate_count": len(product_ids)},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Valio API credentials are not configured",
+        )
+
+    if product_ids:
         client = ValioClient()
         try:
             price_response = client.fetch_price(request.customer_id, request.requested_date, product_ids)

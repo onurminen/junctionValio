@@ -492,6 +492,8 @@ audit persistence, and UI/API failure paths. There are deliberately no
 unit-conversion tests because the demo does not perform implicit
 conversions. A live mock API smoke check has also been performed; repeat
 it manually when supplier credentials or challenge data change.
+Missing supplier credentials are tested to return HTTP 503 before a
+supplier client is constructed or a proposal is persisted.
 
 The test boundary must continue to verify that supplier failures,
 unknown availability, unauthorized calls, and incomplete proposals

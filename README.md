@@ -112,4 +112,5 @@ multiple agent/customer associations, use comma-separated
 - Free-form `hard_constraints` are rejected by policy until represented as supported structured fields; a constraint must never be treated as satisfied merely because it was recorded as text.
 - A `429` from Valio is returned as `429` with `Retry-After` (at least 30 seconds); the client suppresses further calls during that cooldown rather than retrying.
 - The live Valio Aimo API is configured through environment variables and never committed to source control.
+- If catalog candidates require live validation but `VALIO_API_KEY` is empty, plan building returns HTTP 503, records a safe configuration-missing audit event, and does not persist a proposal.
 - The static JSON dataset in `data/` is used for deterministic local development and tests.

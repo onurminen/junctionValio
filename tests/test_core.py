@@ -871,6 +871,42 @@ def test_purchase_plan_rejects_more_than_100_lines_before_supplier_call(
     assert response.status_code == 422
 
 
+def test_purchase_plan_fails_without_valio_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    def unexpected_supplier_client() -> None:
+        raise AssertionError("supplier client must not be constructed without credentials")
+
+    audit_events: list[dict] = []
+    monkeypatch.setattr(main, "VALIO_API_KEY", "")
+    monkeypatch.setattr(main, "ValioClient", unexpected_supplier_client)
+    monkeypatch.setattr(
+        main.audit_service,
+        "record",
+        lambda **event: audit_events.append(event),
+    )
+    monkeypatch.setattr(
+        main.database,
+        "save_plan",
+        lambda *_args, **_kwargs: pytest.fail("unverified plans must not be persisted"),
+    )
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [{"query": "chocolate", "quantity": "1", "unit": "KI"}],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Valio API credentials are not configured"
+    assert audit_events[0]["outcome"] == "credentials_missing"
+
+
 def test_purchase_plan_prefers_lowest_eligible_price_per_sales_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
