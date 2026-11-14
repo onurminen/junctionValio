@@ -48,7 +48,9 @@ or spend limits, so the prototype requires human approval by default.
     requirements.
 -   [ ] A validated order proposal can be created for human approval.
     No supplier order submission is possible with the challenge API.
--   [ ] Agent permissions and spending limits are enforced server-side.
+-   [x] Agent permissions and spending limits are enforced server-side.
+    Request, plan, and approval-request routes bind the caller to an
+    `X-Agent-Token`; production fails closed when tokens are missing.
 -   [ ] A purchase proposal can be held for human approval.
 -   [ ] Approval is bound to the exact proposal contents and
     expires/becomes invalid if those contents change.
@@ -363,9 +365,10 @@ error codes and actionable messages. - Include correlation/request
 IDs. - Use idempotency keys for order submission if possible. - Keep
 supplier API credentials server-side. - Do not expose internal supplier
 credentials or unrestricted backend access to the agent. - Document
-authentication assumptions. For a hackathon demo, a seeded demo identity
-may be acceptable, but clearly label it as a prototype and keep
-authorization checks active.
+authentication assumptions. Agent tokens are matched to the requested
+identity and bound to the owner of any plan submitted for approval. A
+seeded demo identity is accepted only in development; production rejects
+agent requests unless tokens are configured.
 
 ## 9. MCP interoperability
 

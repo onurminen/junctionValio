@@ -30,10 +30,16 @@ class ApprovalService:
             }
         )
 
-    def create_request(self, plan_id: str) -> ApprovalRecord:
+    def create_request(
+        self,
+        plan_id: str,
+        requesting_agent: str | None = None,
+    ) -> ApprovalRecord:
         plan = self.store.get_plan(plan_id)
         if plan is None:
             raise KeyError("purchase plan not found")
+        if requesting_agent is not None and plan["agent_id"] != requesting_agent:
+            raise PermissionError("agent is not authorized for this purchase plan")
         if plan["decision"] != "PENDING_APPROVAL":
             raise ValueError("only plans requiring approval can have an approval request")
         with self.store.session() as session:

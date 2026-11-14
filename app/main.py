@@ -18,7 +18,9 @@ from starlette.responses import Response
 
 from app.adapters.valio_client import ValioClient, ValioRateLimited
 from app.config import (
+    APP_ENV,
     BASE_DIR,
+    TRUSTED_TRADE_AGENT_TOKENS,
     TRUSTED_TRADE_APPROVER_TOKENS,
     VALIO_API_KEY,
 )
@@ -248,6 +250,46 @@ def _approver_tokens() -> dict[str, str]:
         if separator and approver.strip() and token.strip():
             tokens[approver.strip()] = token.strip()
     return tokens
+
+
+def _agent_tokens() -> dict[str, str]:
+    tokens: dict[str, str] = {}
+    if not TRUSTED_TRADE_AGENT_TOKENS:
+        return tokens
+    for entry in TRUSTED_TRADE_AGENT_TOKENS.split(","):
+        agent, separator, token = entry.partition(":")
+        agent = agent.strip()
+        token = token.strip()
+        if not separator or not agent or not token or agent in tokens:
+            raise HTTPException(status_code=503, detail="Agent token configuration is invalid")
+        tokens[agent] = token
+    return tokens
+
+
+def _authenticated_agent(token: str, requested_agent_id: str | None = None) -> str:
+    tokens = _agent_tokens()
+    if not tokens:
+        if APP_ENV.lower() in {"production", "prod"}:
+            raise HTTPException(
+                status_code=503,
+                detail="Agent authentication is not configured",
+            )
+        if requested_agent_id and requested_agent_id != "demo-agent":
+            raise HTTPException(status_code=401, detail="Invalid agent credentials")
+        return requested_agent_id or "demo-agent"
+
+    token_bytes = token.encode("utf-8")
+    matches = [
+        agent
+        for agent, expected in tokens.items()
+        if secrets.compare_digest(token_bytes, expected.encode("utf-8"))
+    ]
+    if len(matches) != 1:
+        raise HTTPException(status_code=401, detail="Invalid agent credentials")
+    authenticated_agent = matches[0]
+    if requested_agent_id and requested_agent_id != authenticated_agent:
+        raise HTTPException(status_code=403, detail="Agent identity does not match the token")
+    return authenticated_agent
 
 
 def _authenticated_approver(token: str) -> str:
@@ -514,8 +556,12 @@ def demo_ui() -> FileResponse:
 
 
 @app.post("/api/requests/parse", response_model=RequestInterpretationResponse)
-def parse_request(payload: RequestInterpretationRequest) -> dict[str, Any]:
-    request = _infer_request(payload.text, payload.customer_id, payload.agent_id, payload.requested_date)
+def parse_request(
+    payload: RequestInterpretationRequest,
+    agent_token: str = Header(default="", alias="X-Agent-Token"),
+) -> dict[str, Any]:
+    agent_id = _authenticated_agent(agent_token, payload.agent_id)
+    request = _infer_request(payload.text, payload.customer_id, agent_id, payload.requested_date)
     query = request.line_items[0].query
     choices = catalog_service.search(query, limit=3) if query else []
     if query and not choices:
@@ -554,9 +600,13 @@ def catalog_search(query: str, limit: int = 5) -> dict[str, Any]:
 
 
 @app.post("/api/purchase-plan/build")
-def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
+def build_purchase_plan(
+    payload: PurchasePlanRequest,
+    agent_token: str = Header(default="", alias="X-Agent-Token"),
+) -> dict[str, Any]:
+    agent_id = _authenticated_agent(agent_token, payload.agent_id)
     request = BuyerRequest(
-        agent_id=payload.agent_id,
+        agent_id=agent_id,
         customer_id=payload.customer_id,
         requested_date=payload.requested_date,
         line_items=payload.line_items,
@@ -775,11 +825,17 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
 
 
 @app.post("/api/approvals/request", response_model=ApprovalResponse)
-def request_approval(payload: ApprovalRequest) -> dict[str, Any]:
+def request_approval(
+    payload: ApprovalRequest,
+    agent_token: str = Header(default="", alias="X-Agent-Token"),
+) -> dict[str, Any]:
+    agent_id = _authenticated_agent(agent_token)
     try:
-        approval = approval_service.create_request(payload.plan_id)
+        approval = approval_service.create_request(payload.plan_id, requesting_agent=agent_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit_service.record(

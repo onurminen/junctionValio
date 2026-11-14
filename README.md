@@ -35,7 +35,16 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
    # configure a private token for each approver before enabling decisions
 
 The demo policy defaults to `demo-agent` associated only with `customer-001`
-and sends every complete proposed order for human approval. The mock API does
+and sends every complete proposed order for human approval. In development,
+only this seeded demo identity is accepted without an agent token. For a
+deployed environment, set `APP_ENV=production` and configure
+`TRUSTED_TRADE_AGENT_TOKENS` as comma-separated `agent-id:secret` entries.
+Send the matching secret in the `X-Agent-Token` header; the backend binds the
+authenticated identity to the requested agent and to the plan owner when an
+approval is requested. Production requests fail closed if agent tokens are
+not configured, and the application defaults to production mode unless
+`APP_ENV` is explicitly set. Each configured agent should also be associated
+with its permitted customer/account in `TRUSTED_TRADE_AGENT_CUSTOMERS`. The mock API does
 not enforce buyer-specific category or spending limits, so the app has no such
 limits unless you explicitly configure `TRUSTED_TRADE_ALLOWED_CATEGORIES`,
 `TRUSTED_TRADE_MAX_LINE_QUANTITY`, or `TRUSTED_TRADE_MAX_ORDER_VALUE`. For

@@ -78,6 +78,9 @@
           <label>Agent ID
             <input id="agent" value="demo-agent" required>
           </label>
+          <label>Agent API token
+            <input id="agent-token" type="password" autocomplete="new-password">
+          </label>
           <label>Customer/account ID
             <input id="customer" value="customer-001" required>
           </label>
@@ -88,7 +91,7 @@
           <button type="submit" id="build">Check price and availability</button>
         </div>
       </form>
-      <p class="note">Enter quantity in the product's sales unit. Unit codes are technical values from the catalog; no unit conversion is assumed.</p>
+      <p class="note">Enter quantity in the product's sales unit. Unit codes are technical values from the catalog; no unit conversion is assumed. The agent token is required when server-side agent tokens are configured.</p>
       <div id="unit-clarification" class="warning" hidden>
         <span id="unit-clarification-text"></span>
         <label class="unit-confirmation">
@@ -149,6 +152,14 @@
     let multipleItemsDetected = false;
     let requiresUnitConfirmation = false;
     let auditEvents = [];
+    function agentHeaders(extra = {}) {
+      const token = $("agent-token").value;
+      return {
+        ...(token ? { "X-Agent-Token": token } : {}),
+        ...extra,
+      };
+    }
+
     $("query").addEventListener("input", () => {
       selectedProductId = null;
       $("unit-confirmed").checked = false;
@@ -232,7 +243,7 @@
         if (selectedProductId) line.selected_product_id = selectedProductId;
         const body = await request("/api/purchase-plan/build", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: agentHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             agent_id: $("agent").value,
             customer_id: $("customer").value,
@@ -320,7 +331,7 @@
         if ($("requested-date").value) payload.requested_date = $("requested-date").value;
         const body = await request("/api/requests/parse", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: agentHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify(payload),
         });
         const line = body.request.line_items[0] || {};
@@ -361,7 +372,7 @@
       try {
         const body = await request("/api/approvals/request", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: agentHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ plan_id: lastPlan.plan_id }),
         });
         $("approval-output").textContent = `Approval requested: ${body.approval.approval_id}`;

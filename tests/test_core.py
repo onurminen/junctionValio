@@ -21,6 +21,14 @@ from app.services.policy_engine import PolicyEngine
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def allow_seeded_demo_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "development")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "")
+
+
 def test_request_parser_finds_a_candidate_product() -> None:
     response = client.post(
         "/api/requests/parse",
@@ -39,6 +47,91 @@ def test_request_parser_finds_a_candidate_product() -> None:
     assert payload["request"]["line_items"][0]["unit"] is None
     assert payload["candidate_products"]
     assert payload["clarification_required"] is True
+
+
+def test_agent_token_binds_request_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "trusted-agent:agent-secret")
+    payload = {
+        "text": "Find chocolate",
+        "customer_id": "customer-001",
+        "agent_id": "trusted-agent",
+    }
+
+    assert client.post("/api/requests/parse", json=payload).status_code == 401
+    assert client.post(
+        "/api/requests/parse",
+        json=payload,
+        headers={"X-Agent-Token": "wrong-secret"},
+    ).status_code == 401
+    assert client.post(
+        "/api/requests/parse",
+        json={**payload, "agent_id": "demo-agent"},
+        headers={"X-Agent-Token": "agent-secret"},
+    ).status_code == 403
+    assert client.post(
+        "/api/requests/parse",
+        json=payload,
+        headers={"X-Agent-Token": "agent-secret"},
+    ).status_code == 200
+
+
+def test_production_agent_routes_fail_closed_without_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "")
+    response = client.post(
+        "/api/requests/parse",
+        json={"text": "Find chocolate"},
+    )
+    assert response.status_code == 503
+
+
+def test_invalid_agent_token_blocks_plan_before_supplier_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "trusted-agent:agent-secret")
+
+    class UnexpectedValioClient:
+        def __init__(self) -> None:
+            raise AssertionError("supplier client must not be constructed for an invalid agent")
+
+    monkeypatch.setattr(main, "ValioClient", UnexpectedValioClient)
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "trusted-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [{"query": "chocolate", "quantity": "1", "unit": "KI"}],
+        },
+        headers={"X-Agent-Token": "wrong-secret"},
+    )
+    assert response.status_code == 401
+
+
+def test_development_agent_identity_is_limited_to_demo_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "development")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "")
+    response = client.post(
+        "/api/requests/parse",
+        json={"text": "Find chocolate", "agent_id": "untrusted-agent"},
+    )
+    assert response.status_code == 401
 
 
 def test_request_interpretation_does_not_invent_missing_values() -> None:
@@ -273,6 +366,8 @@ def test_approval_api_requires_approver_token_and_persists_decision(
 ) -> None:
     import app.main as main
 
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "demo-agent:agent-secret")
     plan_id = f"plan-{uuid4().hex}"
     snapshot = {
         "plan_id": plan_id,
@@ -287,7 +382,11 @@ def test_approval_api_requires_approver_token_and_persists_decision(
         "demo-agent",
         "customer-001",
     )
-    requested = client.post("/api/approvals/request", json={"plan_id": plan_id})
+    requested = client.post(
+        "/api/approvals/request",
+        json={"plan_id": plan_id},
+        headers={"X-Agent-Token": "agent-secret"},
+    )
     assert requested.status_code == 200
     approval_id = requested.json()["approval"]["approval_id"]
     monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:test-secret")
@@ -328,6 +427,34 @@ def test_approval_api_requires_approver_token_and_persists_decision(
         json={**decision, "approved": False},
         headers=headers,
     ).status_code == 409
+
+
+def test_approval_request_is_limited_to_plan_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "trusted-agent:agent-secret")
+    plan_id = f"plan-{uuid4().hex}"
+    database.save_plan(
+        plan_id,
+        {
+            "plan_id": plan_id,
+            "agent_id": "another-agent",
+            "customer_id": "customer-001",
+            "lines": [],
+        },
+        "PENDING_APPROVAL",
+        "another-agent",
+        "customer-001",
+    )
+    response = client.post(
+        "/api/approvals/request",
+        json={"plan_id": plan_id},
+        headers={"X-Agent-Token": "agent-secret"},
+    )
+    assert response.status_code == 403
 
 
 def test_catalog_normalizes_fractional_technical_lot_size() -> None:
@@ -380,6 +507,8 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
 
     monkeypatch.setattr(main, "VALIO_API_KEY", "test-key")
     monkeypatch.setattr(main, "ValioClient", MockValioClient)
+    monkeypatch.setattr(main, "APP_ENV", "production")
+    monkeypatch.setattr(main, "TRUSTED_TRADE_AGENT_TOKENS", "demo-agent:agent-secret")
     response = client.post(
         "/api/purchase-plan/build",
         json={
@@ -388,6 +517,7 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
             "requested_date": "2026-11-16",
             "line_items": [{"query": "chocolate", "quantity": "2", "unit": "KI"}],
         },
+        headers={"X-Agent-Token": "agent-secret"},
     )
 
     assert response.status_code == 200
