@@ -14,15 +14,25 @@ The demo must complete an end-to-end flow:
 4.  A recommendation component selects a suitable purchasing plan.
 5.  A deterministic policy engine decides whether the agent may proceed,
     needs human approval, or must be rejected.
-6.  The system places the order through the mock backend when
-    authorized.
+6.  The system persists a proposal for human approval. The challenge API
+    has no order-submission endpoint, so this demo must not claim or
+    simulate a placed order.
 7.  The system records an auditable history of the request, checks,
-    approvals, and order result.
+    approval decision, and proposal status.
 
 **Core principle:** Gemini may interpret, compare, recommend, and
 explain. It must never be the authority that grants permission or
 directly commits an order. Deterministic backend code validates every
-action.
+proposal and approval action.
+
+**Confirmed challenge constraints:** mentors confirmed there is no order
+API; producing an order proposal for human review is the expected
+commitment step. Availability `>= 999999` means quantity is unknown, an
+empty availability schedule means unavailable, `0.01` lot size is to be
+treated as `1`, and `closingTime` is the cutoff for its associated
+`availableDate`. Respect HTTP 429 by waiting at least 30 seconds before
+another supplier call. Supplier policy does not enforce buyer approval
+or spend limits, so the prototype requires human approval by default.
 
 ## 2. Success criteria
 
@@ -36,14 +46,15 @@ action.
     structured data.
 -   [ ] Candidate products are ranked against explicit buyer
     requirements.
--   [ ] An order can be validated and submitted to the mock backend.
+-   [ ] A validated order proposal can be created for human approval.
+    No supplier order submission is possible with the challenge API.
 -   [ ] Agent permissions and spending limits are enforced server-side.
--   [ ] An order can be held for human approval.
--   [ ] Approval is bound to the exact order contents and
+-   [ ] A purchase proposal can be held for human approval.
+-   [ ] Approval is bound to the exact proposal contents and
     expires/becomes invalid if those contents change.
 -   [ ] Important actions are persisted in an audit log.
 -   [ ] The UI clearly shows the request, recommendation, policy
-    outcome, approval status, and order result.
+    outcome, approval status, and that no supplier order was submitted.
 -   [ ] The project can be run and demonstrated reliably using
     documented setup instructions.
 
@@ -52,7 +63,8 @@ action.
 -   [ ] MCP server exposes the same core procurement capabilities as the
     REST API.
 -   [ ] OpenAPI specification documents the external interface.
--   [ ] Idempotency prevents accidental duplicate order submissions.
+-   [ ] A future order adapter can use idempotency if a real order API
+    becomes available.
 -   [ ] Partial availability and safe substitution flow is demonstrated.
 -   [ ] Backend is deployed on Modal.
 -   [ ] Aiven PostgreSQL is used for persistent application data and
@@ -89,6 +101,12 @@ Do this before designing assumptions into the application.
 8.  Record gaps or ambiguous semantics; ask the challenge mentors rather
     than inventing behavior.
 
+**Confirmed:** the published OpenAPI documents price, availability, and
+file-download operations, but no order creation, order lookup, or
+reservation operation. Do not add a supplier order client or display a
+supplier-confirmed order state unless the challenge publishes such an
+endpoint.
+
 Do not assume that example fields in this plan match the real API. Adapt
 the internal domain model to the actual mock API and isolate external
 API details in an integration adapter.
@@ -108,7 +126,7 @@ Buyer / Demo UI
       v
 FastAPI application
       |
-      +---- Request interpretation (Gemini)
+      +---- Structured request interpretation (deterministic; optional Gemini)
       |
       +---- Product discovery service
       |          |
@@ -119,9 +137,7 @@ FastAPI application
       |
       +---- Policy / authorization engine
       |
-      +---- Approval service
-      |
-      +---- Order service --------> Valio mock API adapter
+      +---- Approval service (proposal only; no supplier order endpoint)
       |
       +---- Audit service
       |
@@ -136,7 +152,8 @@ FastAPI application
     environment).
 -   FastAPI for the backend.
 -   Pydantic for request/response validation.
--   Gemini API through the official Google Gen AI SDK.
+-   Optional Gemini API through the official Google Gen AI SDK, only if
+    available and useful for the demo.
 -   PostgreSQL on Aiven for persistence.
 -   SQLAlchemy or SQLModel for database access; choose one and keep it
     consistent.
@@ -174,8 +191,9 @@ Likely concepts:
     price/availability snapshot, and reasons.
 -   `Approval`: pending/approved/rejected state, approver, timestamp,
     and immutable snapshot/hash of the approved order.
--   `Order`: external order identifier, submitted contents, status, and
-    backend response.
+-   `OrderProposal`: selected lines, price/availability snapshot,
+    approval status, and immutable snapshot/hash. This is not a supplier
+    order and has no external order ID.
 -   `AuditEvent`: actor, action, timestamp, correlation ID, relevant
     entity IDs, outcome, and structured metadata.
 
@@ -187,15 +205,18 @@ invent allergen, origin, certification, stock, or sustainability facts.
 ### Workflow A: interpret a buyer request
 
 1.  UI sends natural-language text to the backend.
-2.  Gemini converts it into a structured `PurchaseRequest`.
-3.  Validate the output with Pydantic.
+2.  A deterministic interpreter extracts explicit values into a
+    structured request. Gemini may be added as an optional assist, but
+    is not required for the core demo.
+3.  Validate extracted values with Pydantic; model output, if used, is
+    untrusted input.
 4.  Ask a clarification question if an essential field is missing or
     ambiguous (for example, quantity unit or delivery date).
 5.  Persist the request and an audit event.
 6.  Return the structured interpretation to the UI for visibility.
 
-Gemini should return structured data, not prose that the backend must
-parse. Treat all model output as untrusted input.
+Do not silently default a missing product, quantity, sales unit, or
+delivery date. Return clarification questions rather than guessing.
 
 ### Workflow B: discover and compare products
 
@@ -209,6 +230,12 @@ parse. Treat all model output as untrusted input.
     lexicographic rules.
 7.  Return a shortlist with evidence and reasons.
 
+The challenge API defines `catalogPrice` as price per sales unit and
+`comparisonPrice` as a normalized price per KG or L. Rank only eligible
+offers in the same requested sales unit and currency by their catalog
+price; show the comparison price separately and never compare KG against
+L or treat the comparison price as an order price.
+
 Separate hard constraints from preferences: - Hard constraints: must be
 satisfied (e.g. explicit allergen exclusion, required delivery deadline,
 allowed category). - Preferences: optimize where possible (e.g. lower
@@ -218,28 +245,27 @@ Never let Gemini invent missing product attributes. If structured data
 is absent, mark the attribute unknown and do not claim the product
 satisfies the requirement.
 
-### Workflow C: validate and place an order
+### Workflow C: validate and create an order proposal
 
 1.  The agent submits a proposed purchase plan.
-2.  Backend rechecks price and availability immediately before
-    commitment if the mock API supports it.
+2.  Backend checks price and availability for the requested customer
+    and delivery date. The challenge API does not expose a reservation
+    or order-commit operation.
 3.  Backend validates customer/account, product IDs, quantities, units,
     delivery date, order limits, and policy.
 4.  Policy engine returns exactly one of:
-    -   `AUTO_APPROVED`: may proceed without human intervention.
-    -   `PENDING_APPROVAL`: hold the order; do not submit it.
-    -   `REJECTED`: hard policy violation; do not submit it.
-5.  If auto-approved, submit using the mock order endpoint.
-6.  If approval is required, persist a pending approval and show it in
-    the UI.
-7.  After a human approves, verify that the approved order snapshot
-    still matches the order being submitted.
-8.  Submit the order and persist the external order ID/status.
-9.  Record every transition in the audit log.
+    -   `AUTO_APPROVED`: valid under the configured policy, but still
+        only a proposal because there is no supplier order endpoint.
+    -   `PENDING_APPROVAL`: persist the proposal and request human review.
+    -   `REJECTED`: hard policy violation; do not approve or submit.
+5.  Persist eligible proposals and their policy evidence. Human
+    approval is required by default for this demo.
+6.  If a human approves, verify the approved snapshot still matches and
+    record the decision. Do not transmit it to the supplier.
+7.  Record every transition in the audit log.
 
-Do not treat a successful local validation as proof that the external
-order was accepted. Only report an order as placed after the mock API
-confirms it.
+Never report an order as submitted or confirmed. A human approval means
+only that the proposal was approved in Trusted Trade.
 
 ### Workflow D: human approval
 
@@ -249,16 +275,17 @@ units. - Delivery date. - Price/total and currency. - Relevant
 constraints and policy outcome. - Snapshot hash or equivalent immutable
 version identifier. - Approver identity and decision timestamp.
 
-If any material order field changes after approval, require a new
-approval. A rejected approval must not be silently resubmitted.
+If any material proposal field changes after approval, require a new
+approval. A rejected proposal must not be silently resubmitted. Approval
+does not submit an order in this challenge.
 
 ### Workflow E: audit trail
 
 Record important events: - Request received and interpreted. - Product
 search performed. - Availability/price checked. - Recommendation
-created. - Order validation result and policy version. - Approval
-requested, approved, or rejected. - Order submission attempted and
-external result received.
+created. - Proposal validation result and policy version. - Approval
+requested, approved, or rejected. In this challenge there is no order
+submission attempt or external order result.
 
 Each event should include a timestamp, correlation ID, actor, action,
 outcome, and relevant IDs. Avoid storing API secrets or unnecessary
@@ -277,7 +304,7 @@ Example policy configuration (adapt to the real product model):
   "agent_id": "hotel-procurement-agent",
   "can_search_products": true,
   "can_check_availability": true,
-  "can_place_orders": true,
+  "can_create_purchase_proposals": true,
   "max_order_value": 2000,
   "currency": "EUR",
   "allowed_categories": ["dairy", "vegetables", "meat"],
@@ -289,15 +316,15 @@ Example policy configuration (adapt to the real product model):
 
 Rules to implement and test:
 
--   Missing ordering permission -\> reject.
+-   Missing permission to create a proposal -\> reject.
 -   Disallowed product category -\> reject.
 -   Order exceeds a hard quantity limit -\> reject or route to approval,
     according to the configured policy.
 -   Order exceeds spending authority -\> pending approval.
 -   Substitution not explicitly allowed -\> pending approval or reject
     according to policy.
--   Price/availability cannot be verified -\> do not auto-place; request
-    intervention.
+-   Price/availability cannot be verified -\> reject the proposal or
+    require human intervention; never claim it is ready to submit.
 -   Product or delivery violates a hard buyer constraint -\> reject
     candidate/order.
 -   Policy version and evaluated facts are recorded.
@@ -326,6 +353,11 @@ POST /api/v1/approvals/{approval_id}/decision
 GET  /api/v1/audit-events
 ```
 
+The order endpoints above are future-facing examples only. The current
+challenge API does not provide order submission or lookup, so Trusted
+Trade must not expose fake `/orders` endpoints or report supplier order
+confirmation.
+
 Requirements: - Validate all input with Pydantic. - Return explicit
 error codes and actionable messages. - Include correlation/request
 IDs. - Use idempotency keys for order submission if possible. - Keep
@@ -342,14 +374,13 @@ Only implement MCP after the REST services and end-to-end flow work.
 Expose a thin MCP server with tools that call the same application
 service functions: - `search_products` - `get_product_details` -
 `check_availability` - `compare_products` - `validate_order` -
-`place_order` (must enforce the same policy and approval rules) -
-`get_order_status`
+`request_approval` - `get_approval_status`
 
 Do not duplicate business logic inside MCP tool handlers. MCP must not
 bypass authorization. Document tool inputs and outputs, and demonstrate
 that an external MCP-compatible client can discover and call at least
-the read-only tools. If feasible, demonstrate an authorized order or
-approval-required response.
+the read-only tools. Do not expose a `place_order` tool unless the
+challenge later publishes a real order endpoint.
 
 ## 10. UI requirements
 
@@ -362,7 +393,8 @@ Keep the UI focused on the judging flow. Three views are sufficient:
 -   Product shortlist with price, pack size, availability and delivery
     fit.
 -   Selected purchase plan and total.
--   Policy outcome and order status.
+-   Policy outcome and proposal/approval status; never imply an order
+    was submitted.
 
 ### Approvals
 
@@ -426,26 +458,24 @@ Minimum automated tests:
 -   Product filtering and ranking.
 -   Policy engine outcomes.
 -   Approval snapshot matching.
--   Idempotency behavior.
 
 ### Integration tests
 
 -   Catalog search against the mock API.
 -   Price and availability lookup.
--   Order validation.
--   Order creation and retrieval.
+-   Purchase-proposal validation.
+-   Approval queue access, exact snapshot display, and token-protected decision.
 -   Database persistence.
 
 ### End-to-end demo tests
 
-1.  Within-limit order is placed automatically.
-2.  Over-limit order is held for approval, then placed after approval.
-3.  Rejected approval prevents order placement.
-4.  Modified order after approval requires a new approval.
+1.  A complete proposal receives the configured policy outcome.
+2.  The default human-review requirement creates a pending approval.
+3.  Rejected approval remains rejected and does not create an order.
+4.  Modified proposal after approval fails the snapshot check.
 5.  Partial availability results in alternatives or a clear exception.
 6.  Supplier API failure does not produce a false success.
-7.  Retried order submission does not create a duplicate if idempotency
-    is supported.
+7.  No endpoint or UI path claims supplier order submission.
 
 Use mock fixtures for repeatable tests, but verify the final demo
 against the actual supplied mock backend.
@@ -465,24 +495,26 @@ against the actual supplied mock backend.
 
 ### Hours 6--18: Core purchasing
 
--   Implement request interpretation with Gemini.
+-   Implement structured request interpretation with explicit
+    clarification for missing or ambiguous values. Add Gemini only if a
+    key and meaningful benefit are available.
 -   Implement catalog search and product details.
 -   Implement price/availability checks.
 -   Implement unit normalization and candidate ranking.
 -   Implement purchase plan response.
 
 **Milestone:** Natural-language request produces a grounded, explainable
-purchase plan.
+purchase proposal without inventing quantity, date, unit, or product.
 
 ### Hours 18--30: Trust and transaction flow
 
 -   Implement policy engine and tests.
--   Implement order validation and placement.
+-   Implement proposal validation and policy evaluation.
 -   Implement approval state machine and UI.
--   Persist orders, approvals and audit events.
+-   Persist proposals, approvals and audit events.
 
-**Milestone:** At least one order can be placed end-to-end, with both
-automatic and approval-required paths.
+**Milestone:** A proposal can be reviewed and approved end-to-end, with
+no false claim that a supplier order was placed.
 
 ### Hours 30--38: Interoperability and deployment
 
@@ -511,14 +543,16 @@ Do not hardcode fictional product availability or pretend an order was
 submitted.
 
 1.  Submit a simple request that fits the agent's policy.
-2.  Show Gemini's structured interpretation.
+2.  Show the structured interpretation and any clarification needed.
 3.  Show catalog candidates and live mock price/availability results.
-4.  Show the selected plan and deterministic reasoning.
-5.  Place the order and show the mock backend confirmation.
-6.  Submit a second request that exceeds the spending limit.
-7.  Show the pending approval in the dashboard.
-8.  Approve it as the buyer and show the resulting order confirmation.
-9.  Open the audit timeline and trace both transactions.
+4.  Show the lowest eligible catalog price per matching sales unit and
+    the separate kg/litre comparison-price evidence.
+5.  Request human approval and show the exact saved proposal.
+6.  Show an exception (for example unknown terminal availability or a
+    passed closing time) requiring review or rejection.
+7.  Approve or reject a proposal as the configured human approver.
+8.  State clearly that approval does not submit an order.
+9.  Open the audit timeline and trace the proposal and decision.
 10. Optionally show an MCP client discovering the same procurement
     tools.
 
@@ -528,7 +562,7 @@ submitted.
   Judging criterion                   Evidence in the demo
   ----------------------------------- -----------------------------------
   Working end-to-end demo (30%)       Real mock API search, availability,
-                                      validation and order creation
+                                      validated proposal and approval
 
   Solving user need (20%)             Structured intent, correct unit
                                       handling, grounded product matching
@@ -558,14 +592,15 @@ submitted.
   Gemini returns invalid or invented  Structured output, Pydantic
   data                                validation, backend evidence checks
 
-  Duplicate orders from retries       Idempotency keys and persisted
-                                      submission state
+  No order endpoint in challenge       Do not create a fake supplier
+                                      order state or claim confirmation
 
   Approval can be reused after edits  Bind approval to immutable order
                                       snapshot
 
-  Price/stock changes before          Recheck immediately before order if
-  submission                          supported
+  Price/stock changes before          Treat supplier data as a snapshot;
+  submission                          require a fresh check for any future
+                                      commit workflow
 
   Aiven/Modal setup consumes time     Local-first development; deploy
                                       after core works
@@ -585,8 +620,8 @@ The project is ready when a judge can:
 -   See a structured interpretation and real catalog candidates.
 -   Understand why a product was selected.
 -   See a deterministic policy decision.
--   Complete an automatic order or a human-approved order.
--   See the confirmed result from the mock backend.
+-   Review and decide on an exact, snapshot-bound proposal.
+-   See that approval is local and no order was transmitted.
 -   Inspect an audit timeline explaining what happened.
 -   Read the documented API contract and understand how an external
     agent would integrate.

@@ -5,7 +5,7 @@ Trusted Trade is a minimal FastAPI prototype for the Junction Valio challenge. I
 ## Features
 
 - Product catalog search against the static Valio challenge dataset
-- Request parsing for simple buyer text
+- Deterministic request extraction that asks for missing quantity, sales unit, or delivery date instead of guessing
 - Deterministic policy engine with typed outcomes
 - SQL-backed purchase plan, approval, and audit records (SQLite by default)
 - Approval snapshot hashing, server-side snapshot lookup, and separate approver token
@@ -75,10 +75,14 @@ multiple agent/customer associations, use comma-separated
 
 - `.env` is loaded automatically and excluded from Git. Keep the platform API key private.
 - The challenge API has no order endpoint; the app produces a structured proposal and holds it for human approval without transmitting it.
+- The browser includes an authenticated approval queue that displays the frozen snapshot and policy rationale before approve/reject. The approver token is entered at runtime and is not stored by the page.
 - Plans, approval snapshots, and audit events are persisted to the configured database. The audit trail is not tamper-proof.
 - Approval decisions require a per-approver token from `TRUSTED_TRADE_APPROVER_TOKENS`, sent in the `X-Approver-Token` header. Configure entries as `approver-id:secret` (comma-separated for multiple approvers). The approver must also be on the allowlist and must differ from the agent.
+- Listing approvals and reading their frozen snapshots also require the approver token; decisions are bound to the identity matched from that token.
 - The default policy does not invent category or spending restrictions; configure them only when buyer-specific rules are known.
+- The request interpreter handles one product line at a time, never fills missing quantity/date/sales unit with defaults, and requires manual splitting or clarification for ambiguous multi-item requests.
 - The planner checks a small static-catalog shortlist with batched price/availability API calls and exposes alternatives. Availability values `>= 999999` are reported as unknown, not as stock, and are sent for human review without applying a quantity cap from that sentinel. `closingTime` is checked against the API's `timeNow` for the associated `availableDate`.
+- Eligible alternatives are ranked by catalog price per matching sales unit; the API's kg/litre comparison price is shown separately and is never used to imply a unit conversion.
 - A `429` from Valio is returned as `429` with `Retry-After` (at least 30 seconds); the client suppresses further calls during that cooldown rather than retrying.
 - The live Valio Aimo API is configured through environment variables and never committed to source control.
 - The static JSON dataset in `data/` is used for deterministic local development and tests.

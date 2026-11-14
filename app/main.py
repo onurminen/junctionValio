@@ -23,7 +23,14 @@ from app.config import (
     VALIO_API_KEY,
 )
 from app.database import database
-from app.domain import BuyerRequest, PurchasePlan, RequestLine
+from app.domain import (
+    ApprovalRecord,
+    ApprovalReview,
+    BuyerRequest,
+    CandidateProduct,
+    PurchasePlan,
+    RequestLine,
+)
 from app.services.approval_service import ApprovalService
 from app.services.audit_service import AuditService
 from app.services.catalog_service import CatalogService
@@ -57,10 +64,34 @@ async def add_correlation_id(
 
 
 class RequestInterpretationRequest(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=4000)
     customer_id: str = "customer-001"
     agent_id: str = "demo-agent"
     requested_date: date | None = None
+
+
+class InterpretedRequestLine(BaseModel):
+    query: str | None = None
+    quantity: Decimal | None = None
+    unit: str | None = None
+    requested_unit_text: str | None = None
+
+
+class StructuredRequestInterpretation(BaseModel):
+    agent_id: str
+    customer_id: str
+    requested_date: date | None = None
+    line_items: list[InterpretedRequestLine] = Field(default_factory=list)
+    buyer_text: str
+    missing_fields: list[str] = Field(default_factory=list)
+    clarification_questions: list[str] = Field(default_factory=list)
+    multiple_items_detected: bool = False
+
+
+class RequestInterpretationResponse(BaseModel):
+    request: StructuredRequestInterpretation
+    candidate_products: list[CandidateProduct]
+    clarification_required: bool
 
 
 class PurchasePlanRequest(BaseModel):
@@ -81,11 +112,133 @@ class ApprovalRequest(BaseModel):
     plan_id: str
 
 
-def _parse_quantity(value: str) -> Decimal:
-    match = re.search(r"(\d+(?:[.,]\d+)?)", value)
-    if not match:
-        return Decimal("1")
-    return Decimal(match.group(1).replace(",", "."))
+class ApprovalResponse(BaseModel):
+    approval: ApprovalRecord
+
+
+class ApprovalListResponse(BaseModel):
+    approvals: list[ApprovalRecord]
+
+
+_NATURAL_UNITS = {
+    "bar", "bars", "bottle", "bottles", "box", "boxes", "case", "cases",
+    "cl", "crate", "crates", "each", "g", "gram", "grams", "kg", "kgs",
+    "kilogram", "kilograms", "l", "liter", "liters", "litre", "litres",
+    "ml", "pack", "packs", "pc", "pcs", "piece", "pieces", "unit", "units",
+}
+_CURRENCY_WORDS = {
+    "cent", "cents", "dollar", "dollars", "eur", "euro", "euros", "gbp",
+    "pound", "pounds", "usd", "budget", "cost", "maximum", "price", "spend",
+    "under",
+}
+_REQUEST_STOP_WORDS = {
+    "a", "an", "and", "available", "based", "before", "by", "customer",
+    "deliver", "delivery", "find", "for", "get", "i", "in", "item", "items",
+    "like", "me", "meets", "need", "of", "on", "option", "order", "our",
+    "please", "price", "product", "products", "purchase", "requirements",
+    "the", "that", "to", "want", "we", "with", "would",
+}
+_WEEKDAYS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "tomorrow", "today", "next", "this", "week", "weekend",
+    "jan", "january", "feb", "february", "mar", "march", "apr", "april",
+    "may", "jun", "june", "jul", "july", "aug", "august", "sep",
+    "september", "oct", "october", "nov", "november", "dec", "december",
+}
+_QUANTITY_PATTERN = re.compile(
+    r"(?<![\w])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?(?![\w])"
+)
+
+
+def _without_account_and_iso_date(text: str) -> str:
+    without_date = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b",
+        " ",
+        text,
+    )
+    month_names = (
+        "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        "jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+    )
+    without_date = re.sub(
+        rf"\b(?:{month_names})\s+\d{{1,2}}(?:st|nd|rd|th)?"
+        rf"(?:,?\s+(?:19|20)\d{{2}})?\b|"
+        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{month_names})"
+        rf"(?:\s+(?:19|20)\d{{2}})?\b",
+        " ",
+        without_date,
+        flags=re.IGNORECASE,
+    )
+    without_date = re.sub(r"\b(?:19|20)\d{2}\b", " ", without_date)
+    return re.sub(
+        r"\b(?:for|to)\s+(?:the\s+)?(?:customer|account|client)\s+[A-Za-z0-9_-]+\b",
+        " ",
+        without_date,
+        flags=re.IGNORECASE,
+    )
+
+
+def _parse_number(value: str) -> Decimal | None:
+    normalized = value.replace(" ", "")
+    if "," in normalized and "." in normalized:
+        if normalized.rfind(",") > normalized.rfind("."):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    elif "," in normalized:
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", normalized):
+            normalized = normalized.replace(",", "")
+        else:
+            normalized = normalized.replace(",", ".")
+    elif "." in normalized and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", normalized):
+        normalized = normalized.replace(".", "")
+    try:
+        quantity = Decimal(normalized)
+    except InvalidOperation:
+        return None
+    return quantity if quantity.is_finite() and quantity > 0 else None
+
+
+def _extract_quantity_and_unit(text: str) -> tuple[Decimal | None, str | None]:
+    cleaned = _without_account_and_iso_date(text)
+    for match in _QUANTITY_PATTERN.finditer(cleaned):
+        following = cleaned[match.end():]
+        if re.match(r"\s*[%$€£]", following):
+            continue
+        unit_match = re.match(r"\s*([A-Za-z]+)\b", following)
+        following_word = unit_match.group(1).lower() if unit_match else None
+        if following_word in _CURRENCY_WORDS:
+            continue
+        before = cleaned[:match.start()]
+        has_purchase_verb = bool(
+            re.search(
+                r"\b(?:need|order|buy|require|want|get)\s*(?:about|around|approximately)?\s*$",
+                before,
+                re.IGNORECASE,
+            )
+        )
+        if following_word not in _NATURAL_UNITS and not has_purchase_verb:
+            continue
+        quantity = _parse_number(match.group())
+        if quantity is None:
+            continue
+        requested_unit = following_word if following_word in _NATURAL_UNITS else None
+        return quantity, requested_unit
+    return None, None
+
+
+def _extract_product_query(text: str) -> str | None:
+    cleaned = _without_account_and_iso_date(text)
+    cleaned = _QUANTITY_PATTERN.sub(" ", cleaned)
+    words = re.findall(r"[\w-]+", cleaned.lower())
+    query_words = [
+        word for word in words
+        if word not in _REQUEST_STOP_WORDS
+        and word not in _NATURAL_UNITS
+        and word not in _CURRENCY_WORDS
+        and word not in _WEEKDAYS
+    ]
+    return " ".join(query_words) or None
 
 
 def _approver_tokens() -> dict[str, str]:
@@ -95,6 +248,18 @@ def _approver_tokens() -> dict[str, str]:
         if separator and approver.strip() and token.strip():
             tokens[approver.strip()] = token.strip()
     return tokens
+
+
+def _authenticated_approver(token: str) -> str:
+    token_bytes = token.encode("utf-8")
+    matches = [
+        approver
+        for approver, expected in _approver_tokens().items()
+        if secrets.compare_digest(token_bytes, expected.encode("utf-8"))
+    ]
+    if len(matches) != 1 or matches[0] not in approval_service.allowed_approvers:
+        raise HTTPException(status_code=401, detail="Invalid or unauthorized approver credentials")
+    return matches[0]
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
@@ -134,12 +299,20 @@ def _assess_candidate(
         catalog_price = {}
     unit_price = _decimal_or_none(catalog_price.get("value"))
     currency = catalog_price.get("currency") or price.get("currency")
+    comparison_price = price.get("comparisonPrice")
+    if not isinstance(comparison_price, dict):
+        comparison_price = {}
+    comparison_price_value = _decimal_or_none(comparison_price.get("value"))
+    comparison_unit = price.get("comparisonUnit")
+    if comparison_unit not in {"KG", "L"}:
+        comparison_unit = None
+    comparison_currency = comparison_price.get("currency") or currency
     price_ok = bool(
         price
         and not price.get("error", True)
         and unit_price is not None
         and unit_price >= 0
-        and currency
+        and currency == "EUR"
     )
     line_total = unit_price * line.quantity if price_ok and unit_price is not None else None
 
@@ -244,6 +417,13 @@ def _assess_candidate(
         "unit_price": str(unit_price) if unit_price is not None else None,
         "line_total": str(line_total) if line_total is not None else None,
         "currency": currency,
+        "comparison_price": (
+            str(comparison_price_value)
+            if comparison_price_value is not None and comparison_price_value >= 0
+            else None
+        ),
+        "comparison_unit": comparison_unit,
+        "comparison_currency": comparison_currency,
         "available_amount": (
             str(available_amount)
             if available_amount is not None and not is_terminal
@@ -262,21 +442,64 @@ def _assess_candidate(
     }
 
 
-def _infer_request(text: str, customer_id: str, agent_id: str, requested_date: date | None) -> BuyerRequest:
-    normalized = text.lower()
-    keywords = ["chocolate", "milk", "cheese", "yogurt", "fruit", "butter", "juice"]
-    query = next((word for word in keywords if word in normalized), "chocolate")
-    quantity = _parse_quantity(text)
+def _infer_request(
+    text: str,
+    customer_id: str,
+    agent_id: str,
+    requested_date: date | None,
+) -> StructuredRequestInterpretation:
+    query = _extract_product_query(text)
+    quantity, requested_unit = _extract_quantity_and_unit(text)
     if requested_date is None:
-        requested_date = date.today()
+        date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+        if date_match:
+            try:
+                requested_date = date.fromisoformat(date_match.group())
+            except ValueError:
+                requested_date = None
 
-    return BuyerRequest(
+    missing_fields: list[str] = []
+    questions: list[str] = []
+    if not query:
+        missing_fields.append("product")
+        questions.append("Which product should I search for?")
+    if quantity is None:
+        missing_fields.append("quantity")
+        questions.append("What quantity do you need?")
+    missing_fields.append("sales_unit")
+    if requested_unit:
+        questions.append(
+            f"You specified {requested_unit}; choose a catalog sales unit and confirm the equivalent quantity. No unit conversion is assumed."
+        )
+    else:
+        questions.append(
+            "Which catalog sales-unit code should be used? No unit conversion is assumed."
+        )
+    if requested_date is None:
+        missing_fields.append("requested_date")
+        questions.append("What delivery date is required? Provide an explicit date.")
+    multiple_items = bool(re.search(r"\b(?:and|plus)\b", text, flags=re.IGNORECASE))
+    if multiple_items:
+        missing_fields.append("line_items")
+        questions.append(
+            "This demo interprets one product line at a time. Split the request into individual product requests."
+        )
+
+    return StructuredRequestInterpretation(
         agent_id=agent_id,
         customer_id=customer_id,
         requested_date=requested_date,
-        line_items=[RequestLine(query=query, quantity=quantity, unit="pcs")],
+        line_items=[
+            InterpretedRequestLine(
+                query=query,
+                quantity=quantity,
+                requested_unit_text=requested_unit,
+            )
+        ],
         buyer_text=text,
-        hard_constraints=["delivery on requested date"] if "delivery" in normalized else [],
+        missing_fields=missing_fields,
+        clarification_questions=questions,
+        multiple_items_detected=multiple_items,
     )
 
 
@@ -290,21 +513,31 @@ def demo_ui() -> FileResponse:
     return FileResponse(Path(BASE_DIR, "app", "static", "index.html"))
 
 
-@app.post("/api/requests/parse")
+@app.post("/api/requests/parse", response_model=RequestInterpretationResponse)
 def parse_request(payload: RequestInterpretationRequest) -> dict[str, Any]:
     request = _infer_request(payload.text, payload.customer_id, payload.agent_id, payload.requested_date)
-    choices = catalog_service.search(request.line_items[0].query, limit=3)
+    query = request.line_items[0].query
+    choices = catalog_service.search(query, limit=3) if query else []
+    if query and not choices:
+        request.missing_fields.append("product")
+        request.clarification_questions.append(
+            f"No catalog matches were found for '{query}'. What product did you mean?"
+        )
     audit_service.record(
         actor=request.agent_id,
         action="request_interpreted",
-        outcome="success" if choices else "no_candidates",
+        outcome="clarification_required" if request.missing_fields else "interpreted",
         entity_type="customer",
         entity_id=request.customer_id,
-        metadata={"line_count": len(request.line_items), "candidate_count": len(choices)},
+        metadata={
+            "missing_fields": request.missing_fields,
+            "candidate_count": len(choices),
+        },
     )
     return {
         "request": request.model_dump(mode="json"),
         "candidate_products": [product.model_dump(mode="json") for product in choices],
+        "clarification_required": bool(request.missing_fields),
     }
 
 
@@ -424,6 +657,14 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
             )
             for candidate in candidates
         ]
+        assessments.sort(
+            key=lambda item: (
+                not item["eligible"],
+                Decimal(item["unit_price"]) if item["eligible"] else Decimal("0"),
+                -item["relevance_score"],
+                item["product_id"],
+            )
+        )
         selected = next((item for item in assessments if item["eligible"]), None)
         if selected is None:
             complete = False
@@ -460,6 +701,9 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
             "unit_price": selected["unit_price"],
             "line_total": selected["line_total"],
             "currency": selected["currency"],
+            "comparison_price": selected["comparison_price"],
+            "comparison_unit": selected["comparison_unit"],
+            "comparison_currency": selected["comparison_currency"],
             "available_amount": selected["available_amount"],
             "availability_quantity_is_unknown": selected["availability_quantity_is_unknown"],
             "available_date": selected["available_date"],
@@ -467,6 +711,7 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
             "availability_checked_at": selected["availability_checked_at"],
             "availability_status": selected["availability_status"],
             "status": "PENDING_HUMAN_APPROVAL",
+            "selection_reason": "lowest verified catalog price per matching sales unit among eligible candidates",
             "review_reasons": selected["review_reasons"],
             "alternatives": assessments,
         })
@@ -497,6 +742,9 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
         currency=currency,
         verified=verified,
         policy_decision=policy.decision,
+        policy_version=policy.policy_version,
+        policy_reasons=policy.reasons,
+        policy_facts=policy.facts,
     )
     plan_data = plan.model_dump(mode="json")
     database.save_plan(
@@ -526,7 +774,7 @@ def build_purchase_plan(payload: PurchasePlanRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/approvals/request")
+@app.post("/api/approvals/request", response_model=ApprovalResponse)
 def request_approval(payload: ApprovalRequest) -> dict[str, Any]:
     try:
         approval = approval_service.create_request(payload.plan_id)
@@ -545,18 +793,20 @@ def request_approval(payload: ApprovalRequest) -> dict[str, Any]:
     return {"approval": approval.model_dump(mode="json")}
 
 
-@app.post("/api/approvals/decide")
+@app.post("/api/approvals/decide", response_model=ApprovalResponse)
 def decide_approval(
     payload: ApprovalDecisionRequest,
     approver_token: str = Header(default="", alias="X-Approver-Token"),
 ) -> dict[str, Any]:
-    expected_token = _approver_tokens().get(payload.approver)
-    if expected_token is None:
-        raise HTTPException(status_code=401, detail="Approver identity is not configured")
-    if not secrets.compare_digest(approver_token, expected_token):
-        raise HTTPException(status_code=401, detail="Invalid approver credentials")
+    authenticated_approver = _authenticated_approver(approver_token)
+    if payload.approver != authenticated_approver:
+        raise HTTPException(status_code=403, detail="Approver identity does not match the token")
     try:
-        approval = approval_service.decide(payload.approval_id, payload.approver, payload.approved)
+        approval = approval_service.decide(
+            payload.approval_id,
+            authenticated_approver,
+            payload.approved,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -572,14 +822,30 @@ def decide_approval(
     return {"approval": approval.model_dump(mode="json")}
 
 
-@app.get("/api/approvals")
-def list_approvals(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+@app.get("/api/approvals", response_model=ApprovalListResponse)
+def list_approvals(
+    limit: int = Query(default=50, ge=1, le=200),
+    approver_token: str = Header(default="", alias="X-Approver-Token"),
+) -> dict[str, Any]:
+    _authenticated_approver(approver_token)
     return {
         "approvals": [
             record.model_dump(mode="json")
             for record in approval_service.list_records(limit)
         ]
     }
+
+
+@app.get("/api/approvals/{approval_id}", response_model=ApprovalReview)
+def get_approval(
+    approval_id: str,
+    approver_token: str = Header(default="", alias="X-Approver-Token"),
+) -> dict[str, Any]:
+    _authenticated_approver(approver_token)
+    review = approval_service.get_review(approval_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="approval request not found")
+    return review.model_dump(mode="json")
 
 
 @app.get("/api/audit")

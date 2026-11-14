@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import TRUSTED_TRADE_APPROVERS
 from app.database import ApprovalRow, Database, database
-from app.domain import ApprovalRecord, ApprovalStatus
+from app.domain import ApprovalRecord, ApprovalReview, ApprovalStatus
 
 
 class ApprovalService:
@@ -142,3 +142,21 @@ class ApprovalService:
                 )
                 for row in rows
             ]
+
+    def get_review(self, approval_id: str) -> ApprovalReview | None:
+        with self.store.session() as session:
+            row = session.get(ApprovalRow, approval_id)
+            if row is None:
+                return None
+            return ApprovalReview(
+                approval=ApprovalRecord(
+                    approval_id=row.approval_id,
+                    plan_id=row.plan_id,
+                    snapshot_hash=row.snapshot_hash,
+                    status=ApprovalStatus(row.status),
+                    approver=row.approver,
+                    created_at=row.created_at,
+                    comment=row.comment,
+                ),
+                snapshot=json.loads(row.snapshot_json),
+            )

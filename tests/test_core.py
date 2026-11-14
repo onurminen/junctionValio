@@ -35,7 +35,103 @@ def test_request_parser_finds_a_candidate_product() -> None:
     payload = response.json()
     assert payload["request"]["customer_id"] == "C-42"
     assert Decimal(payload["request"]["line_items"][0]["quantity"]) >= Decimal("12")
+    assert payload["request"]["line_items"][0]["query"] == "chocolate"
+    assert payload["request"]["line_items"][0]["unit"] is None
     assert payload["candidate_products"]
+    assert payload["clarification_required"] is True
+
+
+def test_request_interpretation_does_not_invent_missing_values() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "I need lactose-free milk by Monday",
+        "customer-001",
+        "demo-agent",
+        None,
+    )
+    line = interpreted.line_items[0]
+    assert line.query == "lactose-free milk"
+    assert line.quantity is None
+    assert line.unit is None
+    assert interpreted.requested_date is None
+    assert set(interpreted.missing_fields) == {
+        "quantity",
+        "sales_unit",
+        "requested_date",
+    }
+
+
+def test_request_interpretation_handles_thousands_and_keeps_units_unconverted() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "I need 1,000 litres of lactose-free milk by Monday",
+        "customer-001",
+        "demo-agent",
+        None,
+    )
+    line = interpreted.line_items[0]
+    assert line.query == "lactose-free milk"
+    assert line.quantity == Decimal("1000")
+    assert line.requested_unit_text == "litres"
+    assert line.unit is None
+    assert "sales_unit" in interpreted.missing_fields
+    assert any("No unit conversion is assumed" in question for question in interpreted.clarification_questions)
+
+
+def test_request_interpretation_does_not_read_delivery_date_as_quantity() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "Please deliver milk by 2026-11-16",
+        "customer-001",
+        "demo-agent",
+        None,
+    )
+    assert interpreted.line_items[0].query == "milk"
+    assert interpreted.line_items[0].quantity is None
+    assert interpreted.requested_date == date(2026, 11, 16)
+
+
+def test_request_interpretation_flags_multiple_items_for_manual_split() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "I need milk and cheese",
+        "customer-001",
+        "demo-agent",
+        date(2026, 11, 16),
+    )
+    assert interpreted.multiple_items_detected is True
+    assert "line_items" in interpreted.missing_fields
+    assert any("Split the request" in question for question in interpreted.clarification_questions)
+
+
+def test_request_interpretation_does_not_mistake_product_percentage_for_quantity() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "Find 2% milk for Monday",
+        "customer-001",
+        "demo-agent",
+        None,
+    )
+    assert interpreted.line_items[0].query == "milk"
+    assert interpreted.line_items[0].quantity is None
+
+
+def test_request_interpretation_does_not_treat_a_budget_as_quantity() -> None:
+    import app.main as main
+
+    interpreted = main._infer_request(
+        "I need milk under 10 euros by Monday",
+        "customer-001",
+        "demo-agent",
+        None,
+    )
+    assert interpreted.line_items[0].query == "milk"
+    assert interpreted.line_items[0].quantity is None
 
 
 def test_catalog_search_returns_results() -> None:
@@ -57,6 +153,9 @@ def test_demo_ui_and_audit_store_are_available(tmp_path) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert "Trusted Trade" in response.text
+    assert "Human approval queue" in response.text
+    assert 'id="approver-token"' in response.text
+    assert 'id="audit-filter"' in response.text
 
     store = Database(f"sqlite:///{tmp_path / 'audit.db'}")
     audit = AuditService(store)
@@ -136,6 +235,9 @@ def test_approval_service_detects_snapshot_mismatch() -> None:
     store.save_plan("plan-1", snapshot, "PENDING_APPROVAL", "demo-agent", "customer-001")
     service = ApprovalService(store, allowed_approvers={"human-approver"})
     approval = service.create_request("plan-1")
+    review = service.get_review(approval.approval_id)
+    assert review is not None
+    assert review.snapshot == snapshot
     with store.session() as session, session.begin():
         row = session.get(PurchasePlanRow, "plan-1")
         row.snapshot_json = json.dumps({**snapshot, "customer_id": "changed"})
@@ -190,6 +292,19 @@ def test_approval_api_requires_approver_token_and_persists_decision(
     approval_id = requested.json()["approval"]["approval_id"]
     monkeypatch.setattr(main, "TRUSTED_TRADE_APPROVER_TOKENS", "human-approver:test-secret")
 
+    assert client.get("/api/approvals").status_code == 401
+    headers = {"X-Approver-Token": "test-secret"}
+    listed = client.get("/api/approvals", headers=headers)
+    assert listed.status_code == 200
+    assert any(item["approval_id"] == approval_id for item in listed.json()["approvals"])
+    review = client.get(f"/api/approvals/{approval_id}", headers=headers)
+    assert review.status_code == 200
+    assert review.json()["snapshot"] == snapshot
+    assert client.get(
+        f"/api/approvals/{approval_id}",
+        headers={"X-Approver-Token": "wrong"},
+    ).status_code == 401
+
     decision = {"approval_id": approval_id, "approver": "human-approver", "approved": True}
     assert client.post(
         "/api/approvals/decide",
@@ -199,14 +314,19 @@ def test_approval_api_requires_approver_token_and_persists_decision(
     response = client.post(
         "/api/approvals/decide",
         json=decision,
-        headers={"X-Approver-Token": "test-secret"},
+        headers=headers,
     )
     assert response.status_code == 200
     assert response.json()["approval"]["status"] == "APPROVED"
     assert client.post(
         "/api/approvals/decide",
+        json={**decision, "approver": "another-approver"},
+        headers=headers,
+    ).status_code == 403
+    assert client.post(
+        "/api/approvals/decide",
         json={**decision, "approved": False},
-        headers={"X-Approver-Token": "test-secret"},
+        headers=headers,
     ).status_code == 409
 
 
@@ -277,8 +397,77 @@ def test_purchase_plan_uses_first_eligible_shortlist_candidate(
     assert plan["total_value"] == "20"
     assert plan["verified"] is True
     assert body["policy"]["decision"] == "PENDING_APPROVAL"
-    assert plan["lines"][0]["alternatives"][0]["availability_status"] == "INSUFFICIENT_STOCK"
+    assert plan["policy_version"] == body["policy"]["policy_version"]
+    assert plan["policy_reasons"] == body["policy"]["reasons"]
+    assert plan["policy_facts"]["human_approval_required"] is True
+    first_alternative = next(
+        item for item in plan["lines"][0]["alternatives"]
+        if item["product_id"] == "460018"
+    )
+    assert first_alternative["availability_status"] == "INSUFFICIENT_STOCK"
     assert "/api/orders/submit" not in app.openapi()["paths"]
+
+
+def test_purchase_plan_prefers_lowest_eligible_price_per_sales_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    prices = {"460018": "9.00", "460105": "5.00", "460220": "0.10", "460448": "7.00", "460452": "0.20"}
+
+    class MockValioClient:
+        def fetch_price(self, customer: str, requested_date, product_ids: list[str]) -> dict:
+            return {
+                "products": [
+                    {
+                        "productId": product_id,
+                        "error": False,
+                        "catalogPrice": {"value": prices[product_id], "currency": "EUR"},
+                        "comparisonPrice": {"value": prices[product_id], "currency": "EUR"},
+                        "comparisonUnit": "KG",
+                    }
+                    for product_id in product_ids
+                ],
+            }
+
+        def fetch_availability(self, customer: str, requested_date, product_ids: list[str]) -> dict:
+            return {
+                "timeNow": "2026-11-14T14:00:00+0200",
+                "products": [
+                    {
+                        "productId": product_id,
+                        "closingTime": "2026-11-15T17:00:00+0200",
+                        "salesBlock": False,
+                        "scheduleLines": [{
+                            "salesBlock": False,
+                            "availableAmount": 3,
+                            "availableDate": "2026-11-16",
+                            "salesUnit": main.catalog_service.get_by_id(product_id).sales_unit,
+                        }],
+                    }
+                    for product_id in product_ids
+                ],
+            }
+
+    monkeypatch.setattr(main, "VALIO_API_KEY", "test-key")
+    monkeypatch.setattr(main, "ValioClient", MockValioClient)
+    response = client.post(
+        "/api/purchase-plan/build",
+        json={
+            "agent_id": "demo-agent",
+            "customer_id": "customer-001",
+            "requested_date": "2026-11-16",
+            "line_items": [{"query": "chocolate", "quantity": "2", "unit": "KI"}],
+        },
+    )
+
+    assert response.status_code == 200
+    line = response.json()["plan"]["lines"][0]
+    assert line["product_id"] == "460105"
+    assert line["unit_price"] == "5.00"
+    assert line["selection_reason"].startswith("lowest verified catalog price")
+    assert line["comparison_price"] == "5.00"
+    assert line["comparison_unit"] == "KG"
 
 
 def test_terminal_unknown_availability_allows_unbounded_quantity_for_review(

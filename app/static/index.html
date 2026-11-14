@@ -28,6 +28,17 @@
     .candidate { display: flex; justify-content: space-between; align-items: flex-start; gap: .8rem; border-top: 1px solid #e6eceb; padding: .7rem 0; }
     .candidate button { flex: 0 0 auto; padding: .45rem .65rem; }
     .candidate-details { font-size: .84rem; line-height: 1.45; }
+    .approval-card { border: 1px solid #dfe6e7; border-radius: 9px; padding: .9rem; margin-top: .8rem; }
+    .approval-card h3 { margin: 0 0 .45rem; font-size: .98rem; }
+    .approval-card ul { margin: .4rem 0; padding-left: 1.2rem; }
+    .approval-card li { margin: .35rem 0; font-size: .84rem; line-height: 1.4; }
+    .audit-event { border-left: 3px solid #176b57; padding: .2rem .8rem .2rem; margin: .8rem 0; }
+    .audit-event h3 { margin: 0; font-size: .9rem; }
+    .audit-event p { margin: .25rem 0; font-size: .8rem; color: #4a6060; }
+    .audit-event pre { max-height: 180px; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 5rem; padding: .65rem .7rem; border: 1px solid #bbc9c9; border-radius: 7px; font: inherit; }
+    .unit-confirmation { display: flex; grid-template-columns: auto 1fr; align-items: flex-start; font-weight: 500; margin-top: .6rem; }
+    .unit-confirmation input { margin: .1rem .5rem 0 0; }
     @media (max-width: 720px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
   </style>
 </head>
@@ -38,14 +49,25 @@
   </header>
   <main>
     <section>
+      <h2>Interpret a buyer request</h2>
+      <label>Describe what you need
+        <textarea id="buyer-text" placeholder="Example: I need 1,000 litres of lactose-free milk by Monday."></textarea>
+      </label>
+      <div class="actions">
+        <button type="button" class="secondary" id="interpret-request">Extract request details</button>
+      </div>
+      <pre id="interpretation-output" hidden aria-live="polite"></pre>
+    </section>
+
+    <section>
       <h2>Build a purchase plan</h2>
       <form id="plan-form">
         <div class="form-grid">
           <label>Product search
-            <input id="query" value="chocolate" required>
+            <input id="query" placeholder="Choose from interpreted request or catalog search" required>
           </label>
           <label>Quantity
-            <input id="quantity" type="number" min="0.001" step="any" value="1" required>
+            <input id="quantity" type="number" min="0.001" step="any" required>
           </label>
           <label>Sales unit code
             <input id="unit" placeholder="Choose from catalog results" required>
@@ -67,6 +89,13 @@
         </div>
       </form>
       <p class="note">Enter quantity in the product's sales unit. Unit codes are technical values from the catalog; no unit conversion is assumed.</p>
+      <div id="unit-clarification" class="warning" hidden>
+        <span id="unit-clarification-text"></span>
+        <label class="unit-confirmation">
+          <input id="unit-confirmed" type="checkbox">
+          I have converted or confirmed the quantity in the selected sales unit.
+        </label>
+      </div>
       <div id="search-results" class="note" aria-live="polite"></div>
     </section>
 
@@ -82,9 +111,30 @@
     </section>
 
     <section class="wide">
-      <h2>Recent audit events</h2>
+      <h2>Human approval queue</h2>
+      <p class="note">The token is sent to this server for approval review and decision requests; it is not saved by the page. Review the exact saved proposal before deciding.</p>
+      <div class="form-grid">
+        <label>Approver ID
+          <input id="approver-id" value="human-approver" autocomplete="username">
+        </label>
+        <label>Approver token
+          <input id="approver-token" type="password" autocomplete="new-password">
+        </label>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" id="refresh-approvals">Load approval queue</button>
+      </div>
+      <div id="approval-queue-status" class="note" aria-live="polite">Enter the configured approver credentials to load requests.</div>
+      <div id="approval-queue"></div>
+    </section>
+
+    <section class="wide">
+      <h2>Audit timeline</h2>
+      <label>Filter by actor, action, outcome, or ID
+        <input id="audit-filter" type="search" placeholder="Type to filter recent events">
+      </label>
       <div class="actions"><button type="button" id="refresh-audit" class="secondary">Refresh audit</button></div>
-      <pre id="audit-output">Loading…</pre>
+      <div id="audit-output" class="note" aria-live="polite">Loading…</div>
     </section>
 
     <section class="wide warning">
@@ -95,13 +145,16 @@
     const $ = (id) => document.getElementById(id);
     let lastPlan = null;
     let selectedProductId = null;
-    $("query").addEventListener("input", () => { selectedProductId = null; });
-    const localDate = new Date();
-    $("requested-date").value = [
-      localDate.getFullYear(),
-      String(localDate.getMonth() + 1).padStart(2, "0"),
-      String(localDate.getDate()).padStart(2, "0"),
-    ].join("-");
+    let interpretedUnitText = null;
+    let multipleItemsDetected = false;
+    let requiresUnitConfirmation = false;
+    let auditEvents = [];
+    $("query").addEventListener("input", () => {
+      selectedProductId = null;
+      $("unit-confirmed").checked = false;
+    });
+    $("quantity").addEventListener("input", () => { $("unit-confirmed").checked = false; });
+    $("unit").addEventListener("input", () => { $("unit-confirmed").checked = false; });
 
     async function request(url, options = {}) {
       const response = await fetch(url, options);
@@ -138,6 +191,7 @@
           button.addEventListener("click", () => {
             selectedProductId = item.product_id;
             $("unit").value = item.sales_unit || "";
+            $("unit-confirmed").checked = false;
             results.querySelectorAll("button").forEach((candidateButton) => {
               candidateButton.textContent = candidateButton === button ? "Selected" : "Select";
             });
@@ -152,6 +206,18 @@
     });
 
     async function buildPlan() {
+      if (!$("plan-form").reportValidity()) return;
+      if (multipleItemsDetected) {
+        $("plan-status").textContent =
+          "This screen handles one product line at a time. Split the request before building a plan.";
+        return;
+      }
+      if (requiresUnitConfirmation && !$("unit-confirmed").checked) {
+        $("plan-status").textContent = interpretedUnitText
+          ? `The request specified ${interpretedUnitText}. Confirm or convert the quantity to the selected catalog sales unit before checking availability.`
+          : "The request did not specify a sales unit. Confirm the quantity in the selected catalog sales unit before checking availability.";
+        return;
+      }
       $("build").disabled = true;
       $("plan-status").textContent = "Checking price and availability…";
       $("approval-request").hidden = true;
@@ -177,11 +243,15 @@
         lastPlan = body.plan;
         $("plan-output").hidden = false;
         $("plan-output").textContent = JSON.stringify(body, null, 2);
+        const selectionReasons = body.plan.lines
+          .map((line) => line.selection_reason)
+          .filter(Boolean);
         $("plan-status").textContent =
           `Policy: ${body.policy.decision}. Plan ${body.plan.plan_id}; ` +
           (body.plan.verified
             ? "known stock and price checked; awaiting human approval."
-            : "review the availability state and alternatives before approving.");
+            : "review the availability state and alternatives before approving.") +
+          (selectionReasons.length ? ` ${selectionReasons.join(". ")}.` : "");
         $("approval-request").hidden = body.policy.decision !== "PENDING_APPROVAL";
         for (const orderLine of body.plan.lines) {
           const heading = document.createElement("h3");
@@ -195,9 +265,13 @@
             const quantity = option.availability_quantity_is_unknown
               ? "quantity unknown (no stock cap inferred)"
               : `available ${option.available_amount ?? "unknown"} ${option.sales_unit || ""}`;
+            const comparison = option.comparison_price
+              ? ` · comparison ${option.comparison_price} ${option.comparison_currency || option.currency || ""}/${option.comparison_unit}`
+              : "";
             details.textContent =
               `${option.name} · ${option.availability_status} · ${quantity} · ` +
               `price ${option.unit_price ?? "unknown"} ${option.currency ?? ""} per ${option.sales_unit || "unit"}` +
+              comparison +
               (option.closing_time ? ` · cutoff ${option.closing_time}` : "") +
               (option.review_reasons?.length ? ` · ${option.review_reasons.join("; ")}` : "");
             const button = document.createElement("button");
@@ -208,6 +282,7 @@
             button.addEventListener("click", () => {
               selectedProductId = option.product_id;
               $("unit").value = option.sales_unit || "";
+              $("unit-confirmed").checked = false;
               buildPlan();
             });
             row.append(details, button);
@@ -227,6 +302,54 @@
       event.preventDefault();
       await buildPlan();
     });
+
+    $("interpret-request").addEventListener("click", async () => {
+      const button = $("interpret-request");
+      if (!$("buyer-text").value.trim()) {
+        $("interpretation-output").hidden = false;
+        $("interpretation-output").textContent = "Enter a request to interpret.";
+        return;
+      }
+      button.disabled = true;
+      try {
+        const payload = {
+          text: $("buyer-text").value,
+          agent_id: $("agent").value,
+          customer_id: $("customer").value,
+        };
+        if ($("requested-date").value) payload.requested_date = $("requested-date").value;
+        const body = await request("/api/requests/parse", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const line = body.request.line_items[0] || {};
+        $("query").value = line.query || "";
+        $("quantity").value = line.quantity ?? "";
+        $("unit").value = line.unit || "";
+        $("requested-date").value = body.request.requested_date || "";
+        selectedProductId = null;
+        interpretedUnitText = line.requested_unit_text || null;
+        multipleItemsDetected = body.request.multiple_items_detected;
+        requiresUnitConfirmation = true;
+        $("unit-confirmed").checked = false;
+        $("unit-clarification").hidden = false;
+        $("unit-clarification-text").textContent = interpretedUnitText
+          ? `The request said ${line.quantity ?? "an unspecified quantity"} ${interpretedUnitText}; the app will not convert it to a catalog sales unit.`
+          : "The request did not specify a quantity unit. Confirm the selected catalog sales unit; no conversion is applied.";
+        $("interpretation-output").hidden = false;
+        $("interpretation-output").textContent = JSON.stringify({
+          structured_request: body.request,
+          candidate_products: body.candidate_products,
+          clarification_required: body.clarification_required,
+        }, null, 2);
+      } catch (error) {
+        $("interpretation-output").hidden = false;
+        $("interpretation-output").textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
     $("compare").addEventListener("click", async () => {
       selectedProductId = null;
       await buildPlan();
@@ -243,6 +366,7 @@
         });
         $("approval-output").textContent = `Approval requested: ${body.approval.approval_id}`;
         await refreshAudit();
+        if ($("approver-token").value) await refreshApprovals();
       } catch (error) {
         $("approval-output").textContent = error.message;
       } finally {
@@ -250,16 +374,186 @@
       }
     });
 
+    function approverHeaders() {
+      return { "X-Approver-Token": $("approver-token").value };
+    }
+
+    function renderApproval(review) {
+      const { approval, snapshot } = review;
+      const card = document.createElement("article");
+      card.className = "approval-card";
+      const heading = document.createElement("h3");
+      heading.textContent = `${approval.status} · ${approval.approval_id}`;
+      card.append(heading);
+
+      const summary = document.createElement("p");
+      summary.className = "candidate-details";
+      summary.textContent =
+        `Agent ${snapshot.agent_id} · account ${snapshot.customer_id} · ` +
+        `delivery ${snapshot.delivery_date} · total ${snapshot.total_value ?? "unknown"} ${snapshot.currency ?? ""} · ` +
+        `policy ${snapshot.policy_decision} (${snapshot.policy_version || "version unknown"})`;
+      card.append(summary);
+
+      const lines = document.createElement("ul");
+      for (const line of snapshot.lines || []) {
+        const item = document.createElement("li");
+        item.textContent =
+          `${line.name || line.query} · product ${line.product_id || "not selected"} · ` +
+          `${line.quantity} ${line.unit || ""} · ${line.unit_price ?? "unknown"} ${line.currency ?? ""} per ${line.sales_unit || "sales unit"} · ` +
+          `total ${line.line_total ?? "unknown"} ${line.currency ?? ""} · ` +
+          `availability ${line.availability_status || line.status || "unknown"}` +
+          (line.comparison_price ? ` · comparison ${line.comparison_price} ${line.comparison_currency || line.currency || ""}/${line.comparison_unit}` : "") +
+          (line.review_reasons?.length ? ` · ${line.review_reasons.join("; ")}` : "");
+        lines.append(item);
+      }
+      card.append(lines);
+
+      const reasons = document.createElement("p");
+      reasons.className = "candidate-details";
+      reasons.textContent = `Why review is required: ${(snapshot.policy_reasons || []).join("; ") || "see the verified facts and line statuses above"}`;
+      card.append(reasons);
+
+      const hash = document.createElement("p");
+      hash.className = "candidate-details";
+      hash.textContent = `Snapshot SHA-256: ${approval.snapshot_hash}`;
+      card.append(hash);
+
+      const policyFacts = document.createElement("details");
+      const policySummary = document.createElement("summary");
+      policySummary.textContent = "Policy facts used";
+      const policyDetails = document.createElement("pre");
+      policyDetails.textContent = JSON.stringify(snapshot.policy_facts || {}, null, 2);
+      policyFacts.append(policySummary, policyDetails);
+      card.append(policyFacts);
+
+      if (approval.status === "PENDING") {
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        for (const [label, approved] of [["Approve", true], ["Reject", false]]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = approved ? "" : "secondary";
+          button.textContent = label;
+          button.addEventListener("click", () => decideApproval(approval.approval_id, approved, actions));
+          actions.append(button);
+        }
+        card.append(actions);
+      } else if (approval.approver) {
+        const decision = document.createElement("p");
+        decision.className = "candidate-details";
+        decision.textContent = `Decision recorded by ${approval.approver}${approval.comment ? ` · ${approval.comment}` : ""}`;
+        card.append(decision);
+      }
+
+      return card;
+    }
+
+    async function refreshApprovals(quiet = false) {
+      const status = $("approval-queue-status");
+      const queue = $("approval-queue");
+      status.classList.remove("error");
+      if (!quiet) status.textContent = "Loading approval requests…";
+      queue.replaceChildren();
+      try {
+        const body = await request("/api/approvals?limit=100", { headers: approverHeaders() });
+        if (!body.approvals.length) {
+          status.textContent = "No approval requests yet.";
+          return;
+        }
+        for (const approval of body.approvals) {
+          const review = await request(
+            `/api/approvals/${encodeURIComponent(approval.approval_id)}`,
+            { headers: approverHeaders() },
+          );
+          queue.append(renderApproval(review));
+        }
+        if (!quiet) status.textContent = `Loaded ${body.approvals.length} approval request(s).`;
+      } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+      }
+    }
+
+    async function decideApproval(approvalId, approved, actions) {
+      if (!window.confirm(`${approved ? "Approve" : "Reject"} proposal ${approvalId}?`)) return;
+      const buttons = actions.querySelectorAll("button");
+      buttons.forEach((button) => { button.disabled = true; });
+      $("approval-queue-status").textContent = "Submitting decision…";
+      try {
+        const body = await request("/api/approvals/decide", {
+          method: "POST",
+          headers: { ...approverHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            approval_id: approvalId,
+            approver: $("approver-id").value,
+            approved,
+          }),
+        });
+        $("approval-queue-status").textContent =
+          `Decision recorded: ${body.approval.status} by ${body.approval.approver}.`;
+        await refreshApprovals(true);
+        await refreshAudit();
+      } catch (error) {
+        $("approval-queue-status").textContent = error.message;
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    }
+
+    $("refresh-approvals").addEventListener("click", () => refreshApprovals());
+    $("approver-token").addEventListener("input", () => {
+      $("approval-queue").replaceChildren();
+      $("approval-queue-status").textContent = "Token changed. Load the queue to authenticate again.";
+      $("approval-queue-status").classList.remove("error");
+    });
+
+    function renderAudit() {
+      const output = $("audit-output");
+      output.replaceChildren();
+      const filter = $("audit-filter").value.trim().toLowerCase();
+      const filtered = auditEvents.filter((event) =>
+        !filter || JSON.stringify(event).toLowerCase().includes(filter)
+      );
+      if (!filtered.length) {
+        output.textContent = auditEvents.length
+          ? "No events match this filter."
+          : "No audit events yet.";
+        return;
+      }
+      const count = document.createElement("p");
+      count.textContent = `Showing ${filtered.length} of ${auditEvents.length} recent event(s).`;
+      output.append(count);
+      for (const event of [...filtered].reverse()) {
+        const item = document.createElement("article");
+        item.className = "audit-event";
+        const heading = document.createElement("h3");
+        heading.textContent = `${event.action} · ${event.outcome}`;
+        const detail = document.createElement("p");
+        detail.textContent =
+          `${event.occurred_at} · actor ${event.actor} · ` +
+          `${event.entity_type || "event"} ${event.entity_id || ""} · correlation ${event.correlation_id}`;
+        const evidence = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "Event details";
+        const metadata = document.createElement("pre");
+        metadata.textContent = JSON.stringify(event.metadata || {}, null, 2);
+        evidence.append(summary, metadata);
+        item.append(heading, detail, evidence);
+        output.append(item);
+      }
+    }
+
     async function refreshAudit() {
       try {
         const body = await request("/api/audit?limit=20");
-        $("audit-output").textContent = JSON.stringify(body.events, null, 2);
+        auditEvents = body.events;
+        renderAudit();
       } catch (error) {
         $("audit-output").textContent = error.message;
       }
     }
 
     $("refresh-audit").addEventListener("click", refreshAudit);
+    $("audit-filter").addEventListener("input", renderAudit);
     refreshAudit();
   </script>
 </body>

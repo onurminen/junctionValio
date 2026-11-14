@@ -77,6 +77,9 @@ class PurchasePlan(BaseModel):
     currency: str | None = None
     verified: bool = False
     policy_decision: PolicyDecision | None = None
+    policy_version: str = "v1"
+    policy_reasons: list[str] = Field(default_factory=list)
+    policy_facts: dict[str, Any] = Field(default_factory=dict)
 
 
 class PolicyEvaluation(BaseModel):
@@ -94,3 +97,8 @@ class ApprovalRecord(BaseModel):
     approver: str | None = None
     created_at: str
     comment: str | None = None
+
+
+class ApprovalReview(BaseModel):
+    approval: ApprovalRecord
+    snapshot: dict[str, Any]
